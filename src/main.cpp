@@ -334,10 +334,18 @@ private:
             return self->WindowProc(message, wParam, lParam);
         }
 
+        auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (self != nullptr) {
+            return self->WindowProc(message, wParam, lParam);
+        }
+
         return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 
     LRESULT WindowProc(UINT message, WPARAM wParam, LPARAM lParam) {
+        if (message == WM_NCCREATE) {
+            return TRUE;
+        }
         switch (message) {
         case WM_CREATE:
             OnCreate();
