@@ -125,9 +125,18 @@ std::vector<uintptr_t> ScanPattern(
     uintptr_t end,
     const std::vector<int>& pattern,
     size_t maxResults,
-    std::string& error) {
+    std::string& error,
+    const std::atomic_bool* cancelRequested) {
 
     std::vector<uintptr_t> results;
+    const auto isCanceled = [&]() {
+        return cancelRequested != nullptr && cancelRequested->load(std::memory_order_relaxed);
+    };
+
+    if (isCanceled()) {
+        error = "Scan canceled.";
+        return results;
+    }
 
     if (pattern.empty()) {
         error = "Pattern is empty.";
@@ -150,6 +159,11 @@ std::vector<uintptr_t> ScanPattern(
 
     uintptr_t cursor = start;
     while (cursor < end && results.size() < maxResults) {
+        if (isCanceled()) {
+            error = "Scan canceled.";
+            break;
+        }
+
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) != sizeof(mbi)) {
             break;
@@ -169,6 +183,11 @@ std::vector<uintptr_t> ScanPattern(
             uintptr_t regionCursor = regionStart;
 
             while (regionCursor < regionEnd && results.size() < maxResults) {
+                if (isCanceled()) {
+                    error = "Scan canceled.";
+                    break;
+                }
+
                 const size_t toRead = static_cast<size_t>(std::min<uintptr_t>(kChunkSize, regionEnd - regionCursor));
                 std::vector<uint8_t> chunk(toRead);
                 SIZE_T bytesRead = 0;

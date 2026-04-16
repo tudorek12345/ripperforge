@@ -32,6 +32,7 @@ public:
     bool StartCapture(DWORD pid, std::string& error);
     void StopCapture();
     bool IsCaptureRunning() const;
+    float QueryCaptureProgress() const;
 
     CapturePollResult Poll();
 

@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@ std::vector<uintptr_t> ScanPattern(
     uintptr_t end,
     const std::vector<int>& pattern,
     size_t maxResults,
-    std::string& error);
+    std::string& error,
+    const std::atomic_bool* cancelRequested = nullptr);
 
 } // namespace rf::core

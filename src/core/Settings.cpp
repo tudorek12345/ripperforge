@@ -97,16 +97,16 @@ AppSettings LoadSettings(const std::wstring& filePath) {
     buffer << stream.rdbuf();
     const std::string content = buffer.str();
 
-    static const std::regex autoRefreshRegex(R"("autoRefresh"\s*:\s*(true|false))");
-    static const std::regex intervalRegex(R"("refreshIntervalMs"\s*:\s*(\d+))");
-    static const std::regex lastDllRegex(R"("lastDllPath"\s*:\s*"([^"]*)")");
-    static const std::regex filterRegex(R"("processFilter"\s*:\s*"([^"]*)")");
-    static const std::regex captureDllRegex(R"("captureDllPath"\s*:\s*"([^"]*)")");
-    static const std::regex captureOutputRegex(R"("captureOutputDir"\s*:\s*"([^"]*)")");
-    static const std::regex lastTextureRegex(R"("lastTextureAssetPath"\s*:\s*"([^"]*)")");
-    static const std::regex lastModelRegex(R"("lastModelAssetPath"\s*:\s*"([^"]*)")");
-    static const std::regex hookDllRegex(R"("hookDllPath"\s*:\s*"([^"]*)")");
-    static const std::regex hookBackendRegex(R"("hookBackend"\s*:\s*"([^"]*)")");
+    static const std::regex autoRefreshRegex(R"json("autoRefresh"\s*:\s*(true|false))json");
+    static const std::regex intervalRegex(R"json("refreshIntervalMs"\s*:\s*(\d+))json");
+    static const std::regex lastDllRegex(R"json("lastDllPath"\s*:\s*"([^"]*)")json");
+    static const std::regex filterRegex(R"json("processFilter"\s*:\s*"([^"]*)")json");
+    static const std::regex captureDllRegex(R"json("captureDllPath"\s*:\s*"([^"]*)")json");
+    static const std::regex captureOutputRegex(R"json("captureOutputDir"\s*:\s*"([^"]*)")json");
+    static const std::regex lastTextureRegex(R"json("lastTextureAssetPath"\s*:\s*"([^"]*)")json");
+    static const std::regex lastModelRegex(R"json("lastModelAssetPath"\s*:\s*"([^"]*)")json");
+    static const std::regex hookDllRegex(R"json("hookDllPath"\s*:\s*"([^"]*)")json");
+    static const std::regex hookBackendRegex(R"json("hookBackend"\s*:\s*"([^"]*)")json");
 
     if (auto autoRefreshMatch = MatchValue(content, autoRefreshRegex)) {
         settings.autoRefresh = (*autoRefreshMatch == "true");

@@ -9,6 +9,7 @@ RipperForge is a native C++20 Windows desktop toolkit for game modding and rever
 - Lightweight memory tools:
   - read/write bytes at address
   - AoB pattern scan (`??` wildcard support)
+  - async worker jobs for long pattern scans (non-blocking UI)
 - AssetRIpper bridge integration:
   - cloned upstream source under `external/AssetRIpper/`
   - writes `%TEMP%/asset_ripper_<pid>.cfg` like upstream injector
@@ -16,6 +17,7 @@ RipperForge is a native C++20 Windows desktop toolkit for game modding and rever
 - Asset Ripper tab:
   - capture DLL + output directory inputs
   - texture/model discovery lists
+  - async capture directory scan workers + auto-scan while capture is running
   - DirectX 11 live preview window (texture + mesh modes)
   - real export actions: `.png`, `.obj`, `.fbx`
 - Hook manager:
@@ -38,6 +40,14 @@ Install Visual Studio 2022 Build Tools with C++:
 
 Without that workload, builds fail with `Microsoft.Cpp.Default.props not found`.
 
+### Install VS C++ workload (required, admin)
+
+Run this in an **elevated** PowerShell or Command Prompt:
+
+```powershell
+"C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe" modify --installPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended
+```
+
 ## Build and run (first-time test)
 
 1. Open **x64 Native Tools Command Prompt for VS 2022**.
@@ -58,6 +68,7 @@ Output binaries are generated under `build/<Configuration>/`.
 4. Select one texture/model and validate:
    - preview renders in DX11 panel
    - export buttons write `.png`, `.obj`, `.fbx`
+   - UI stays responsive while asset scan is running (`Scan Assets` button shows `Scanning...`)
 5. In **Hook Manager**, generate a MinHook/Detours template and inject hook DLL into a test process.
 
 ## AssetRIpper backend build
@@ -102,4 +113,3 @@ See `plugins/SamplePlugin.cpp` for a minimal plugin implementation.
 
 - Build `external/AssetRIpper/ripper.cpp` into your capture DLL (`ripper_new6.dll` or preferred name) and point the Asset Ripper tab to that DLL.
 - Extend model preview loading beyond OBJ (currently OBJ is preview/export-ready; FBX export is generated from loaded mesh data).
-- Add async worker jobs for long memory scans and large capture directory scans to keep UI responsive under heavy loads.

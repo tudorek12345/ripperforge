@@ -198,15 +198,26 @@ bool AssetRipperBridge::IsCaptureRunning() const {
     return captureRunning_;
 }
 
+float AssetRipperBridge::QueryCaptureProgress() const {
+    if (!bridgeActive_ || bridgeApi_ == nullptr || bridgeApi_->getProgress == nullptr) {
+        return -1.0f;
+    }
+
+    const float progress = bridgeApi_->getProgress();
+    if (progress < 0.0f || progress > 1.0f) {
+        return -1.0f;
+    }
+
+    return progress;
+}
+
 CapturePollResult AssetRipperBridge::Poll() {
     CapturePollResult result = ScanOutputDirectory();
 
-    if (bridgeActive_ && bridgeApi_ != nullptr && bridgeApi_->getProgress != nullptr) {
-        const float bridgeProgress = bridgeApi_->getProgress();
-        if (bridgeProgress >= 0.0f && bridgeProgress <= 1.0f) {
-            result.progress01 = bridgeProgress;
-            return result;
-        }
+    const float bridgeProgress = QueryCaptureProgress();
+    if (bridgeProgress >= 0.0f) {
+        result.progress01 = bridgeProgress;
+        return result;
     }
 
     if (!captureRunning_) {

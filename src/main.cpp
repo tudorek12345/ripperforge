@@ -8,14 +8,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cwchar>
+#include <cwctype>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/AssetIO.h"
@@ -41,6 +47,10 @@ constexpr wchar_t kWindowTitle[] = L"RipperForge - Native Modding Toolkit";
 constexpr UINT_PTR kProcessRefreshTimerId = 10;
 constexpr UINT_PTR kCaptureProgressTimerId = 11;
 constexpr UINT_PTR kPreviewRenderTimerId = 12;
+constexpr ULONGLONG kAutoCaptureScanIntervalMs = 1500;
+
+constexpr UINT kMessageMemoryScanComplete = WM_APP + 101;
+constexpr UINT kMessageCaptureScanComplete = WM_APP + 102;
 
 enum ControlId : int {
     IDC_SEARCH_EDIT = 1001,
@@ -199,6 +209,70 @@ std::wstring BytesToHexString(const std::vector<uint8_t>& bytes) {
     return stream.str();
 }
 
+std::wstring ToLower(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) {
+        return static_cast<wchar_t>(towlower(c));
+    });
+    return value;
+}
+
+template <size_t N>
+bool HasAnyExtension(const std::filesystem::path& path, const std::array<const wchar_t*, N>& extensions) {
+    const std::wstring ext = ToLower(path.extension().wstring());
+    for (const auto* candidate : extensions) {
+        if (ext == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <size_t N>
+std::vector<std::filesystem::path> EnumerateFilesWithExtensions(
+    const std::wstring& root,
+    const std::array<const wchar_t*, N>& extensions) {
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+
+    if (root.empty() || !std::filesystem::exists(root, ec)) {
+        return files;
+    }
+
+    std::filesystem::recursive_directory_iterator end{};
+    const auto options = std::filesystem::directory_options::skip_permission_denied;
+    for (std::filesystem::recursive_directory_iterator it(root, options, ec); !ec && it != end; it.increment(ec)) {
+        const auto& entry = *it;
+        std::error_code entryError;
+        if (!entry.is_regular_file(entryError) || entryError) {
+            continue;
+        }
+        if (HasAnyExtension(entry.path(), extensions)) {
+            files.push_back(entry.path());
+        }
+    }
+
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+struct MemoryScanJobResult {
+    uint64_t jobId = 0;
+    DWORD pid = 0;
+    std::vector<uintptr_t> results;
+    std::string error;
+    uint64_t elapsedMs = 0;
+};
+
+struct CaptureDirectoryScanResult {
+    uint64_t jobId = 0;
+    std::wstring outputDirectory;
+    std::vector<std::filesystem::path> textures;
+    std::vector<std::filesystem::path> models;
+    bool logResult = false;
+    uint64_t elapsedMs = 0;
+    std::string error;
+};
+
 class MainWindow {
 public:
     bool Create(HINSTANCE instance) {
@@ -279,6 +353,12 @@ private:
         case WM_TIMER:
             OnTimer(wParam);
             return 0;
+        case kMessageMemoryScanComplete:
+            OnMemoryScanCompleted(reinterpret_cast<MemoryScanJobResult*>(lParam));
+            return 0;
+        case kMessageCaptureScanComplete:
+            OnCaptureScanCompleted(reinterpret_cast<CaptureDirectoryScanResult*>(lParam));
+            return 0;
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORLISTBOX:
@@ -332,7 +412,7 @@ private:
         assetBridge_.SetOutputDirectory(settings_.captureOutputDir);
 
         RefreshProcessList(true);
-        RefreshCapturedAssets(false);
+        RequestCaptureScan(false);
 
         std::string previewError;
         if (previewRenderer_.Initialize(assetPreviewHost_, previewError)) {
@@ -361,6 +441,11 @@ private:
     }
 
     void OnDestroy() {
+        shuttingDown_ = true;
+        if (memoryScanCancelToken_) {
+            memoryScanCancelToken_->store(true);
+        }
+
         KillTimer(hwnd_, kProcessRefreshTimerId);
         KillTimer(hwnd_, kCaptureProgressTimerId);
         KillTimer(hwnd_, kPreviewRenderTimerId);
@@ -1346,7 +1431,7 @@ private:
             HandleMemoryWrite();
             break;
         case IDC_MEM_SCAN_BUTTON:
-            HandlePatternScan();
+            BeginPatternScan();
             break;
         case IDC_CAPTURE_START_BUTTON:
             StartCapture();
@@ -1361,7 +1446,7 @@ private:
             BrowseForDirectory(captureOutputEdit_);
             break;
         case IDC_CAPTURE_SCAN_BUTTON:
-            RefreshCapturedAssets(true);
+            RequestCaptureScan(true);
             break;
         case IDC_EXPORT_PNG_BUTTON:
             ExportCurrentTexturePng();
@@ -1416,14 +1501,23 @@ private:
 
         if (timerId == kCaptureProgressTimerId) {
             if (assetBridge_.IsCaptureRunning()) {
-                const core::CapturePollResult poll = assetBridge_.Poll();
-                const int progress = static_cast<int>(std::clamp(poll.progress01, 0.0f, 1.0f) * 100.0f);
+                const float bridgeProgress = assetBridge_.QueryCaptureProgress();
+                int progress = 0;
+                if (bridgeProgress >= 0.0f && bridgeProgress <= 1.0f) {
+                    progress = static_cast<int>(std::clamp(bridgeProgress, 0.0f, 1.0f) * 100.0f);
+                } else {
+                    progress = static_cast<int>(std::min<uint32_t>(95, lastCaptureAssetCount_));
+                }
                 SendMessageW(captureProgress_, PBM_SETPOS, progress, 0);
 
-                if (poll.totalCount != lastCaptureAssetCount_) {
-                    lastCaptureAssetCount_ = poll.totalCount;
-                    RefreshCapturedAssets(false);
+                const ULONGLONG now = GetTickCount64();
+                if (!captureScanRunning_ && now - lastCaptureScanKickMs_ >= kAutoCaptureScanIntervalMs) {
+                    RequestCaptureScan(false);
                 }
+            } else if (captureRunning_) {
+                captureRunning_ = false;
+                SendMessageW(captureProgress_, PBM_SETPOS, 0, 0);
+                RequestCaptureScan(false);
             }
             return;
         }
@@ -1683,7 +1777,22 @@ private:
         core::Logger::Instance().Info("Wrote " + std::to_string(bytes.size()) + " bytes to 0x" + AddressToHex(address));
     }
 
-    void HandlePatternScan() {
+    void SetMemoryScanUiState(bool running) {
+        HWND button = GetDlgItem(pageWindows_[static_cast<size_t>(TabIndex::Memory)], IDC_MEM_SCAN_BUTTON);
+        if (button == nullptr) {
+            return;
+        }
+
+        EnableWindow(button, running ? FALSE : TRUE);
+        SetWindowTextW(button, running ? L"Scanning..." : L"Scan");
+    }
+
+    void BeginPatternScan() {
+        if (memoryScanRunning_) {
+            core::Logger::Instance().Info("Memory scan is already running.");
+            return;
+        }
+
         const DWORD pid = GetSelectedPid();
         if (pid == 0) {
             core::Logger::Instance().Error("Select a process before scanning.");
@@ -1703,23 +1812,76 @@ private:
         const uintptr_t start = reinterpret_cast<uintptr_t>(systemInfo.lpMinimumApplicationAddress);
         const uintptr_t end = reinterpret_cast<uintptr_t>(systemInfo.lpMaximumApplicationAddress);
 
-        core::Logger::Instance().Info("Scanning memory (this can take a while)...");
-        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-        const auto results = core::ScanPattern(pid, start, end, pattern, 256, error);
-        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        SendMessageW(memResultsList_, LB_RESETCONTENT, 0, 0);
+        SendMessageW(memResultsList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"<scan in progress...>"));
 
-        if (!error.empty()) {
-            core::Logger::Instance().Error("Scan failed: " + error);
+        memoryScanRunning_ = true;
+        SetMemoryScanUiState(true);
+
+        memoryScanCancelToken_ = std::make_shared<std::atomic_bool>(false);
+        const uint64_t jobId = ++memoryScanJobCounter_;
+        activeMemoryScanJobId_ = jobId;
+
+        const HWND targetWindow = hwnd_;
+        auto cancelToken = memoryScanCancelToken_;
+        const std::string patternText = WideToUtf8(GetWindowTextString(memPatternEdit_));
+        core::Logger::Instance().Info("Scanning memory asynchronously: pattern \"" + patternText + "\"");
+
+        std::thread([targetWindow, jobId, pid, start, end, pattern = std::move(pattern), cancelToken]() mutable {
+            auto* result = new MemoryScanJobResult();
+            result->jobId = jobId;
+            result->pid = pid;
+
+            const auto begin = std::chrono::steady_clock::now();
+            result->results = core::ScanPattern(pid, start, end, pattern, 256, result->error, cancelToken.get());
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            result->elapsedMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+
+            if (!PostMessageW(targetWindow, kMessageMemoryScanComplete, 0, reinterpret_cast<LPARAM>(result))) {
+                delete result;
+            }
+        }).detach();
+    }
+
+    void OnMemoryScanCompleted(MemoryScanJobResult* rawResult) {
+        std::unique_ptr<MemoryScanJobResult> result(rawResult);
+        if (!result) {
+            return;
+        }
+        if (shuttingDown_) {
+            return;
+        }
+
+        if (result->jobId != activeMemoryScanJobId_) {
+            return;
+        }
+
+        memoryScanRunning_ = false;
+        SetMemoryScanUiState(false);
+
+        if (result->error == "Scan canceled.") {
+            core::Logger::Instance().Info("Memory scan canceled.");
+            return;
+        }
+
+        if (!result->error.empty()) {
+            core::Logger::Instance().Error("Scan failed: " + result->error);
             return;
         }
 
         SendMessageW(memResultsList_, LB_RESETCONTENT, 0, 0);
-        for (const auto address : results) {
+        for (const auto address : result->results) {
             const std::wstring line = L"0x" + Utf8ToWide(AddressToHex(address));
             SendMessageW(memResultsList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
         }
+        if (result->results.empty()) {
+            SendMessageW(memResultsList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"<no matches>"));
+        }
 
-        core::Logger::Instance().Info("Pattern scan complete: " + std::to_string(results.size()) + " hits.");
+        core::Logger::Instance().Info(
+            "Pattern scan complete: " + std::to_string(result->results.size()) +
+            " hits in " + std::to_string(result->elapsedMs) + " ms.");
     }
 
     void StartCapture() {
@@ -1751,8 +1913,10 @@ private:
 
         captureRunning_ = true;
         lastCaptureAssetCount_ = 0;
+        lastCaptureScanKickMs_ = 0;
         SendMessageW(captureProgress_, PBM_SETPOS, 0, 0);
         core::Logger::Instance().Info("AssetRIpper capture started for PID " + std::to_string(pid) + ".");
+        RequestCaptureScan(false);
     }
 
     void StopCapture() {
@@ -1760,11 +1924,20 @@ private:
         captureRunning_ = false;
         SendMessageW(captureProgress_, PBM_SETPOS, 0, 0);
         core::Logger::Instance().Info("Capture stopped.");
+        RequestCaptureScan(false);
     }
 
-    void RefreshCapturedAssets(bool logResult) {
-        capturedTextureAssets_ = assetBridge_.EnumerateTextureAssets();
-        capturedModelAssets_ = assetBridge_.EnumerateModelAssets();
+    void SetCaptureScanUiState(bool running) {
+        HWND button = GetDlgItem(pageWindows_[static_cast<size_t>(TabIndex::AssetRipper)], IDC_CAPTURE_SCAN_BUTTON);
+        if (button == nullptr) {
+            return;
+        }
+
+        EnableWindow(button, running ? FALSE : TRUE);
+        SetWindowTextW(button, running ? L"Scanning..." : L"Scan Assets");
+    }
+
+    void ApplyCaptureAssetLists(bool logResult) {
         lastCaptureAssetCount_ = static_cast<uint32_t>(capturedTextureAssets_.size() + capturedModelAssets_.size());
 
         SendMessageW(assetTextureList_, LB_RESETCONTENT, 0, 0);
@@ -1789,6 +1962,107 @@ private:
             core::Logger::Instance().Info(
                 "Capture scan: " + std::to_string(capturedTextureAssets_.size()) + " textures, " +
                 std::to_string(capturedModelAssets_.size()) + " models.");
+        }
+    }
+
+    void RequestCaptureScan(bool logResult) {
+        if (captureScanRunning_) {
+            queuedCaptureScan_ = true;
+            queuedCaptureScanLog_ = queuedCaptureScanLog_ || logResult;
+            if (logResult) {
+                core::Logger::Instance().Info("Capture scan queued. Current scan still running.");
+            }
+            return;
+        }
+
+        settings_.captureOutputDir = GetWindowTextString(captureOutputEdit_);
+        assetBridge_.SetOutputDirectory(settings_.captureOutputDir);
+
+        const std::wstring outputDir = settings_.captureOutputDir;
+        if (outputDir.empty()) {
+            core::Logger::Instance().Error("Capture output directory is empty.");
+            return;
+        }
+
+        captureScanRunning_ = true;
+        queuedCaptureScan_ = false;
+        queuedCaptureScanLog_ = false;
+        SetCaptureScanUiState(true);
+
+        lastCaptureScanKickMs_ = GetTickCount64();
+        const uint64_t jobId = ++captureScanJobCounter_;
+        activeCaptureScanJobId_ = jobId;
+        const HWND targetWindow = hwnd_;
+
+        if (logResult) {
+            core::Logger::Instance().Info("Scanning capture output asynchronously...");
+        }
+
+        std::thread([targetWindow, jobId, outputDir, logResult]() {
+            auto* result = new CaptureDirectoryScanResult();
+            result->jobId = jobId;
+            result->outputDirectory = outputDir;
+            result->logResult = logResult;
+
+            const auto begin = std::chrono::steady_clock::now();
+
+            try {
+                constexpr std::array<const wchar_t*, 8> kTextureExtensions = {
+                    L".dds", L".png", L".jpg", L".jpeg", L".bmp", L".tif", L".tiff", L".gif",
+                };
+                constexpr std::array<const wchar_t*, 8> kModelExtensions = {
+                    L".obj", L".fbx", L".glb", L".gltf", L".ply", L".stl", L".dae", L".x",
+                };
+
+                result->textures = EnumerateFilesWithExtensions(outputDir, kTextureExtensions);
+                result->models = EnumerateFilesWithExtensions(outputDir, kModelExtensions);
+            } catch (const std::exception& ex) {
+                result->error = ex.what();
+            }
+
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            result->elapsedMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+
+            if (!PostMessageW(targetWindow, kMessageCaptureScanComplete, 0, reinterpret_cast<LPARAM>(result))) {
+                delete result;
+            }
+        }).detach();
+    }
+
+    void OnCaptureScanCompleted(CaptureDirectoryScanResult* rawResult) {
+        std::unique_ptr<CaptureDirectoryScanResult> result(rawResult);
+        if (!result) {
+            return;
+        }
+        if (shuttingDown_) {
+            return;
+        }
+
+        if (result->jobId != activeCaptureScanJobId_) {
+            return;
+        }
+
+        captureScanRunning_ = false;
+        SetCaptureScanUiState(false);
+
+        if (!result->error.empty()) {
+            core::Logger::Instance().Error("Capture scan failed: " + result->error);
+        } else {
+            capturedTextureAssets_ = std::move(result->textures);
+            capturedModelAssets_ = std::move(result->models);
+            ApplyCaptureAssetLists(result->logResult);
+
+            if (result->logResult) {
+                core::Logger::Instance().Info("Capture scan finished in " + std::to_string(result->elapsedMs) + " ms.");
+            }
+        }
+
+        if (queuedCaptureScan_) {
+            const bool queuedLog = queuedCaptureScanLog_;
+            queuedCaptureScan_ = false;
+            queuedCaptureScanLog_ = false;
+            RequestCaptureScan(queuedLog);
         }
     }
 
@@ -1944,7 +2218,7 @@ private:
         }
 
         wchar_t backend[64]{};
-        ComboBox_GetLBTextW(hookBackendCombo_, selection, backend);
+        ComboBox_GetLBText(hookBackendCombo_, selection, backend);
         return backend;
     }
 
@@ -1952,7 +2226,7 @@ private:
         const int count = ComboBox_GetCount(hookBackendCombo_);
         for (int i = 0; i < count; ++i) {
             wchar_t item[64]{};
-            ComboBox_GetLBTextW(hookBackendCombo_, i, item);
+            ComboBox_GetLBText(hookBackendCombo_, i, item);
             if (_wcsicmp(item, backend.c_str()) == 0) {
                 ComboBox_SetCurSel(hookBackendCombo_, i);
                 return;
@@ -1969,7 +2243,7 @@ private:
         }
 
         wchar_t engine[64]{};
-        ComboBox_GetLBTextW(hookEngineCombo_, engineSelection, engine);
+        ComboBox_GetLBText(hookEngineCombo_, engineSelection, engine);
         const std::wstring backend = GetHookBackend();
 
         std::filesystem::path outputDir = std::filesystem::path(GetModuleDirectory()) / L"hooks" /
@@ -2149,7 +2423,17 @@ private:
 
     bool captureRunning_ = false;
     bool previewInitialized_ = false;
+    bool shuttingDown_ = false;
+    bool memoryScanRunning_ = false;
+    bool captureScanRunning_ = false;
+    bool queuedCaptureScan_ = false;
+    bool queuedCaptureScanLog_ = false;
     uint32_t lastCaptureAssetCount_ = 0;
+    ULONGLONG lastCaptureScanKickMs_ = 0;
+    uint64_t memoryScanJobCounter_ = 0;
+    uint64_t activeMemoryScanJobId_ = 0;
+    uint64_t captureScanJobCounter_ = 0;
+    uint64_t activeCaptureScanJobId_ = 0;
 
     std::wstring configPath_;
     std::wstring pluginDir_;
@@ -2163,6 +2447,7 @@ private:
     std::vector<std::filesystem::path> capturedModelAssets_;
     std::vector<core::ProcessInfo> processes_;
     std::vector<std::wstring> pendingLogs_;
+    std::shared_ptr<std::atomic_bool> memoryScanCancelToken_;
     plugins::PluginManager pluginManager_;
 };
 
