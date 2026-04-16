@@ -1,0 +1,23 @@
+Goal:
+- Provide a Windows x64 asset capture tool composed of an injector executable and an injected DirectX hook DLL.
+
+Current features:
+- Injector GUI lists running processes, lets you choose a target PID, DLL path, and output directory, then injects via LoadLibrary using CreateRemoteThread.
+- CLI launch mode can start a process suspended and inject before D3D device creation.
+- Writes temp config (asset_ripper_<pid>.cfg) with output directory plus auto-capture/overlay, frame-capture, and glTF toggles for the DLL to consume.
+- Hook DLL installs Detours hooks for D3D9 (DrawIndexedPrimitive) and D3D11 (DrawIndexed), with a watcher thread to attach when DX modules load later.
+- Present bootstrap: dummy D3D9/D3D11 devices are created to detour Present so hooks can attach even if you inject long after the device was created; Present hook installs draw hooks on first frame.
+- Captures vertex/index buffers (range-based), stage-0 textures (DX10 DDS with format/mips/arrays), and vertex/pixel shader bytecode dumps.
+- Hotkeys: F9 toggles full-frame glTF capture (press again to finalize), F10 capture once, F11 toggle per-draw capture, F12 request shutdown/cleanup. Background writer thread saves OBJ/DDS/DXBC artifacts plus `frame_####.glb` and is signaled to flush on shutdown.
+- Auto-capture can be throttled by N draws per S seconds to avoid queue overflow in heavy scenes.
+- Logs include a session header (PID/exe/command line/modules/config) and note when indirect draws are observed; glTF toggle state is logged at start.
+- Basic filtering skips tiny/likely UI draws and guards against bad index ranges. Hooks detach and threads are stopped on unload.
+- Dev environment setup: `.vscode` now includes MSVC/SDK-aware IntelliSense config using env vars, and `build.bat` builds both injector and DLL (expects Detours at C:\detours\ or override via env vars).
+
+Next steps to consider:
+- Add robust device-detection for already-created devices (e.g., scan live vtables) to cover pre-injection creations.
+- Expand glTF/texture handling (more DXGI formats, mip levels, cubemaps) and improve material inference.
+- Add shader disassembly (D3DDisassemble) for readable output alongside hex dumps.
+- UI improvements: status log, auto-detect DLL alongside EXE, and a checkbox for auto-capture.
+- Add per-draw metadata (topology, strides, render target info) and optional overlay toggle to filter UI passes more reliably.
+- Add a build script/solution plus minimal tests or sanity checks for exporter output.

@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "name": "x64-msvc",
+            "compilerPath": "${env:VCToolsInstallDir}bin/Hostx64/x64/cl.exe",
+            "intelliSenseMode": "windows-msvc-x64",
+            "cppStandard": "c++17",
+            "cStandard": "c11",
+            "defines": [
+                "WIN32",
+                "_WINDOWS",
+                "_CRT_SECURE_NO_WARNINGS"
+            ],
+            "includePath": [
+                "${workspaceFolder}",
+                "${env:VCToolsInstallDir}include",
+                "${env:WindowsSdkDir}Include\\${env:WindowsSDKVersion}ucrt",
+                "${env:WindowsSdkDir}Include\\${env:WindowsSDKVersion}shared",
+                "${env:WindowsSdkDir}Include\\${env:WindowsSDKVersion}um",
+                "C:/detours/include"
+            ]
+        }
+    ],
+    "version": 4
+}

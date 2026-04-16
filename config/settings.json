@@ -1,0 +1,12 @@
+﻿{
+  "autoRefresh": true,
+  "refreshIntervalMs": 2000,
+  "lastDllPath": "",
+  "processFilter": "",
+  "captureDllPath": "",
+  "captureOutputDir": "",
+  "lastTextureAssetPath": "",
+  "lastModelAssetPath": "",
+  "hookDllPath": "",
+  "hookBackend": "MinHook"
+}

@@ -1,0 +1,15 @@
+# Build artifacts
+*.exe
+*.dll
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# Capture outputs
+captures/
+*.dds
+*.dxbc
+*.glb
+*.log
