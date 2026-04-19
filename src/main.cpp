@@ -1,10 +1,9 @@
-﻿
 #include <Windows.h>
-#include <Windowsx.h>
-#include <commctrl.h>
 #include <commdlg.h>
-#include <dwmapi.h>
+#include <d3d11.h>
+#include <shellapi.h>
 #include <shlobj.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -12,13 +11,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <cwchar>
-#include <cwctype>
-#include <exception>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
-#include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -34,80 +32,49 @@
 #include "core/Settings.h"
 #include "plugins/PluginManager.h"
 
-#pragma comment(lib, "Comctl32.lib")
-#pragma comment(lib, "Dwmapi.lib")
+#include "imgui.h"
+#include "imgui_internal.h"
+#include "imgui_impl_dx11.h"
+#include "imgui_impl_win32.h"
+
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace {
 
 using namespace rf;
+using Microsoft::WRL::ComPtr;
 
-constexpr wchar_t kWindowClassName[] = L"RipperForgeMainWindow";
-constexpr wchar_t kWindowTitle[] = L"RipperForge - Native Modding Toolkit";
+constexpr wchar_t kWindowClassName[] = L"RipperForgeImGuiMainWindow";
+constexpr wchar_t kWindowTitle[] = L"RipperForge - Asset Injection + Reverse Toolkit";
+constexpr uint64_t kAutoCaptureScanIntervalMs = 1500;
 
-constexpr UINT_PTR kProcessRefreshTimerId = 10;
-constexpr UINT_PTR kCaptureProgressTimerId = 11;
-constexpr UINT_PTR kPreviewRenderTimerId = 12;
-constexpr ULONGLONG kAutoCaptureScanIntervalMs = 1500;
-
-constexpr UINT kMessageMemoryScanComplete = WM_APP + 101;
-constexpr UINT kMessageCaptureScanComplete = WM_APP + 102;
-
-enum ControlId : int {
-    IDC_SEARCH_EDIT = 1001,
-    IDC_REFRESH_BUTTON,
-    IDC_AUTO_REFRESH,
-    IDC_ELEVATE_BUTTON,
-    IDC_PROCESS_LIST,
-    IDC_TAB_CONTROL,
-
-    IDC_DLL_PATH_EDIT = 2001,
-    IDC_DLL_BROWSE_BUTTON,
-    IDC_DLL_INJECT_BUTTON,
-
-    IDC_MEM_ADDRESS_EDIT = 3001,
-    IDC_MEM_BYTES_EDIT,
-    IDC_MEM_READ_BUTTON,
-    IDC_MEM_WRITE_BUTTON,
-    IDC_MEM_PATTERN_EDIT,
-    IDC_MEM_SCAN_BUTTON,
-    IDC_MEM_RESULT_LIST,
-
-    IDC_CAPTURE_START_BUTTON = 4001,
-    IDC_CAPTURE_STOP_BUTTON,
-    IDC_CAPTURE_PROGRESS,
-    IDC_CAPTURE_DLL_EDIT,
-    IDC_CAPTURE_DLL_BROWSE,
-    IDC_CAPTURE_OUTPUT_EDIT,
-    IDC_CAPTURE_OUTPUT_BROWSE,
-    IDC_CAPTURE_SCAN_BUTTON,
-    IDC_CAPTURE_TEXTURE_LIST,
-    IDC_CAPTURE_MODEL_LIST,
-    IDC_CAPTURE_PREVIEW_HOST,
-    IDC_EXPORT_PNG_BUTTON,
-    IDC_EXPORT_OBJ_BUTTON,
-    IDC_EXPORT_FBX_BUTTON,
-
-    IDC_HOOK_ENGINE_COMBO = 5001,
-    IDC_HOOK_DLL_EDIT,
-    IDC_HOOK_DLL_BROWSE,
-    IDC_HOOK_BACKEND_COMBO,
-    IDC_HOOK_GEN_TEMPLATE,
-    IDC_HOOK_INJECT,
-
-    IDC_PLUGIN_RELOAD_BUTTON = 6001,
-    IDC_PLUGIN_LIST,
-
-    IDC_LOG_EDIT = 7001,
+constexpr std::array<const char*, 6> kScanTypeLabels = {
+    "int32",
+    "int64",
+    "float",
+    "double",
+    "utf8_string",
+    "byte_array",
 };
 
-enum class TabIndex : int {
-    Injector = 0,
-    Memory,
-    AssetRipper,
-    Hooks,
-    Plugins,
-    Logs,
-    Count,
+constexpr std::array<const char*, 6> kScanCompareLabels = {
+    "exact",
+    "changed",
+    "unchanged",
+    "increased",
+    "decreased",
+    "equals",
+};
+
+constexpr std::array<const wchar_t*, 3> kHookEngines = {
+    L"Unity",
+    L"Source",
+    L"Unreal",
+};
+
+constexpr std::array<const wchar_t*, 2> kHookBackends = {
+    L"MinHook",
+    L"Detours",
 };
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -140,113 +107,269 @@ std::string WideToUtf8(const std::wstring& value) {
     return result;
 }
 
-std::wstring GetWindowTextString(HWND control) {
-    const int length = GetWindowTextLengthW(control);
-    if (length <= 0) {
-        return {};
-    }
-
-    std::wstring value(static_cast<size_t>(length + 1), L'\0');
-    GetWindowTextW(control, value.data(), length + 1);
-    value.resize(static_cast<size_t>(length));
-    return value;
-}
-
 std::wstring GetModuleDirectory() {
     wchar_t modulePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
     return std::filesystem::path(modulePath).parent_path().wstring();
 }
 
-bool ParseHexAddress(const std::wstring& text, uintptr_t& outAddress) {
-    std::wstring normalized = text;
-    if (normalized.rfind(L"0x", 0) == 0 || normalized.rfind(L"0X", 0) == 0) {
-        normalized = normalized.substr(2);
+template <size_t N>
+void SetBuffer(std::array<char, N>& buffer, const std::string& value) {
+    buffer.fill('\0');
+    if (value.empty()) {
+        return;
+    }
+    strncpy_s(buffer.data(), buffer.size(), value.c_str(), _TRUNCATE);
+}
+
+template <size_t N>
+std::string BufferString(const std::array<char, N>& buffer) {
+    return std::string(buffer.data());
+}
+
+template <size_t N>
+void SetBuffer(std::array<char, N>& buffer, const std::wstring& value) {
+    SetBuffer(buffer, WideToUtf8(value));
+}
+
+bool ParseAddress(const std::string& text, uintptr_t& outAddress) {
+    std::string normalized;
+    normalized.reserve(text.size());
+    for (const char c : text) {
+        if (c != ' ' && c != '\t') {
+            normalized.push_back(c);
+        }
     }
 
     if (normalized.empty()) {
         return false;
     }
-
-    wchar_t* end = nullptr;
-    outAddress = static_cast<uintptr_t>(wcstoull(normalized.c_str(), &end, 16));
-    return end != nullptr && *end == L'\0';
-}
-
-bool ParseHexByteList(const std::wstring& text, std::vector<uint8_t>& out) {
-    out.clear();
-    std::wstringstream stream(text);
-    std::wstring token;
-
-    while (stream >> token) {
-        if (token.size() > 2) {
-            return false;
-        }
-
-        wchar_t* end = nullptr;
-        const auto value = wcstoul(token.c_str(), &end, 16);
-        if (end == nullptr || *end != L'\0' || value > 0xFF) {
-            return false;
-        }
-
-        out.push_back(static_cast<uint8_t>(value));
+    if (normalized.rfind("0x", 0) == 0 || normalized.rfind("0X", 0) == 0) {
+        normalized = normalized.substr(2);
+    }
+    if (normalized.empty()) {
+        return false;
     }
 
-    return true;
+    char* end = nullptr;
+    outAddress = static_cast<uintptr_t>(std::strtoull(normalized.c_str(), &end, 16));
+    return end != nullptr && *end == '\0';
 }
 
-std::wstring BytesToHexString(const std::vector<uint8_t>& bytes) {
-    std::wstringstream stream;
-    stream << std::uppercase << std::hex << std::setfill(L'0');
-
-    for (size_t i = 0; i < bytes.size(); ++i) {
-        if (i > 0) {
-            stream << L' ';
-        }
-        stream << std::setw(2) << static_cast<int>(bytes[i]);
-    }
-
+std::string FormatAddress(uintptr_t address) {
+    std::ostringstream stream;
+    stream << "0x" << std::uppercase << std::hex << address;
     return stream.str();
 }
 
-std::wstring ToLower(std::wstring value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) {
-        return static_cast<wchar_t>(towlower(c));
-    });
-    return value;
+std::string HrToHex(HRESULT hr) {
+    std::ostringstream stream;
+    stream << "0x" << std::uppercase << std::hex << static_cast<unsigned long>(hr);
+    return stream.str();
 }
 
-template <size_t N>
-bool HasAnyExtension(const std::filesystem::path& path, const std::array<const wchar_t*, N>& extensions) {
-    const std::wstring ext = ToLower(path.extension().wstring());
-    for (const auto* candidate : extensions) {
-        if (ext == candidate) {
-            return true;
+std::string Win32ErrorToString(DWORD errorCode) {
+    if (errorCode == 0) {
+        return "success";
+    }
+
+    LPSTR messageBuffer = nullptr;
+    const DWORD messageLength = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        errorCode,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPSTR>(&messageBuffer),
+        0,
+        nullptr);
+
+    std::string message;
+    if (messageLength > 0 && messageBuffer != nullptr) {
+        message.assign(messageBuffer, messageLength);
+        LocalFree(messageBuffer);
+    } else {
+        message = "Unknown Win32 error";
+    }
+
+    while (!message.empty() && (message.back() == '\r' || message.back() == '\n' || message.back() == ' ')) {
+        message.pop_back();
+    }
+
+    return message;
+}
+
+core::TypedScanValueType TypeFromIndex(int index) {
+    if (index < 0 || index >= static_cast<int>(kScanTypeLabels.size())) {
+        return core::TypedScanValueType::Int32;
+    }
+    return static_cast<core::TypedScanValueType>(index);
+}
+
+int IndexFromType(core::TypedScanValueType type) {
+    return static_cast<int>(type);
+}
+
+core::TypedScanCompareMode CompareModeFromIndex(int index) {
+    if (index < 0 || index >= static_cast<int>(kScanCompareLabels.size())) {
+        return core::TypedScanCompareMode::Exact;
+    }
+    return static_cast<core::TypedScanCompareMode>(index);
+}
+
+int IndexFromCompareMode(core::TypedScanCompareMode mode) {
+    return static_cast<int>(mode);
+}
+
+std::wstring TypeToWString(core::TypedScanValueType type) {
+    return Utf8ToWide(kScanTypeLabels[IndexFromType(type)]);
+}
+
+core::TypedScanValueType TypeFromWString(const std::wstring& value) {
+    const std::string narrowed = WideToUtf8(value);
+    for (int i = 0; i < static_cast<int>(kScanTypeLabels.size()); ++i) {
+        if (_stricmp(narrowed.c_str(), kScanTypeLabels[static_cast<size_t>(i)]) == 0) {
+            return TypeFromIndex(i);
         }
     }
-    return false;
+    return core::TypedScanValueType::Int32;
+}
+
+std::wstring CompareToWString(core::TypedScanCompareMode mode) {
+    return Utf8ToWide(kScanCompareLabels[IndexFromCompareMode(mode)]);
+}
+
+core::TypedScanCompareMode CompareFromWString(const std::wstring& value) {
+    const std::string narrowed = WideToUtf8(value);
+    for (int i = 0; i < static_cast<int>(kScanCompareLabels.size()); ++i) {
+        if (_stricmp(narrowed.c_str(), kScanCompareLabels[static_cast<size_t>(i)]) == 0) {
+            return CompareModeFromIndex(i);
+        }
+    }
+    return core::TypedScanCompareMode::Exact;
+}
+
+size_t DefaultTypeByteSize(core::TypedScanValueType type) {
+    switch (type) {
+    case core::TypedScanValueType::Int32:
+    case core::TypedScanValueType::Float:
+        return 4;
+    case core::TypedScanValueType::Int64:
+    case core::TypedScanValueType::Double:
+        return 8;
+    case core::TypedScanValueType::Utf8String:
+        return 32;
+    case core::TypedScanValueType::ByteArray:
+        return 16;
+    default:
+        return 4;
+    }
+}
+
+bool BrowseOpenFile(HWND owner, const wchar_t* filter, std::wstring& outPath) {
+    wchar_t fileBuffer[MAX_PATH]{};
+    OPENFILENAMEW openFile{};
+    openFile.lStructSize = sizeof(openFile);
+    openFile.hwndOwner = owner;
+    openFile.lpstrFilter = filter;
+    openFile.lpstrFile = fileBuffer;
+    openFile.nMaxFile = MAX_PATH;
+    openFile.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if (!GetOpenFileNameW(&openFile)) {
+        return false;
+    }
+
+    outPath = fileBuffer;
+    return true;
+}
+
+bool BrowseDirectory(HWND owner, std::wstring& outPath) {
+    BROWSEINFOW browseInfo{};
+    browseInfo.hwndOwner = owner;
+    browseInfo.lpszTitle = L"Select directory";
+    browseInfo.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    PIDLIST_ABSOLUTE itemList = SHBrowseForFolderW(&browseInfo);
+    if (itemList == nullptr) {
+        return false;
+    }
+
+    wchar_t path[MAX_PATH]{};
+    const bool ok = SHGetPathFromIDListW(itemList, path) == TRUE;
+    CoTaskMemFree(itemList);
+    if (!ok) {
+        return false;
+    }
+
+    outPath = path;
+    return true;
+}
+
+bool BrowseSaveFile(
+    HWND owner,
+    const wchar_t* filter,
+    const wchar_t* defaultExt,
+    const std::wstring& initialName,
+    std::wstring& outPath) {
+
+    wchar_t fileBuffer[MAX_PATH]{};
+    if (!initialName.empty()) {
+        wcsncpy_s(fileBuffer, initialName.c_str(), _TRUNCATE);
+    }
+
+    OPENFILENAMEW saveFile{};
+    saveFile.lStructSize = sizeof(saveFile);
+    saveFile.hwndOwner = owner;
+    saveFile.lpstrFilter = filter;
+    saveFile.lpstrFile = fileBuffer;
+    saveFile.nMaxFile = MAX_PATH;
+    saveFile.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    saveFile.lpstrDefExt = defaultExt;
+
+    if (!GetSaveFileNameW(&saveFile)) {
+        return false;
+    }
+
+    outPath = fileBuffer;
+    return true;
 }
 
 template <size_t N>
 std::vector<std::filesystem::path> EnumerateFilesWithExtensions(
     const std::wstring& root,
     const std::array<const wchar_t*, N>& extensions) {
-    std::vector<std::filesystem::path> files;
-    std::error_code ec;
 
-    if (root.empty() || !std::filesystem::exists(root, ec)) {
+    std::vector<std::filesystem::path> files;
+    if (root.empty()) {
         return files;
     }
 
-    std::filesystem::recursive_directory_iterator end{};
-    const auto options = std::filesystem::directory_options::skip_permission_denied;
-    for (std::filesystem::recursive_directory_iterator it(root, options, ec); !ec && it != end; it.increment(ec)) {
-        const auto& entry = *it;
-        std::error_code entryError;
-        if (!entry.is_regular_file(entryError) || entryError) {
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec)) {
+        return files;
+    }
+
+    auto isMatch = [&](const std::filesystem::path& path) {
+        std::wstring ext = path.extension().wstring();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) {
+            return static_cast<wchar_t>(towlower(c));
+        });
+        for (const auto* candidate : extensions) {
+            if (ext == candidate) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file()) {
             continue;
         }
-        if (HasAnyExtension(entry.path(), extensions)) {
+        if (isMatch(entry.path())) {
             files.push_back(entry.path());
         }
     }
@@ -255,2223 +378,2101 @@ std::vector<std::filesystem::path> EnumerateFilesWithExtensions(
     return files;
 }
 
-struct MemoryScanJobResult {
+bool ParseOffsetsCsv(const std::string& csv, std::vector<uintptr_t>& offsets) {
+    offsets.clear();
+    std::stringstream stream(csv);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        std::string trimmed;
+        for (const char c : token) {
+            if (c != ' ' && c != '\t') {
+                trimmed.push_back(c);
+            }
+        }
+        if (trimmed.empty()) {
+            continue;
+        }
+        uintptr_t value = 0;
+        if (!ParseAddress(trimmed, value)) {
+            return false;
+        }
+        offsets.push_back(value);
+    }
+    return true;
+}
+
+void ApplyIndustrialTheme(const std::string& densitySetting) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* colors = style.Colors;
+
+    colors[ImGuiCol_Text] = ImVec4(0.92f, 0.93f, 0.95f, 1.00f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.55f, 0.58f, 0.62f, 1.00f);
+    colors[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.08f, 0.10f, 1.00f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.09f, 0.10f, 0.12f, 1.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.11f, 0.13f, 1.00f);
+    colors[ImGuiCol_Border] = ImVec4(0.30f, 0.33f, 0.38f, 0.85f);
+    colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.14f, 0.16f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.19f, 0.22f, 0.27f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.21f, 0.25f, 0.31f, 1.00f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.09f, 0.10f, 0.13f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.13f, 0.15f, 0.19f, 1.00f);
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.09f, 0.10f, 0.13f, 1.00f);
+    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.09f, 0.10f, 0.11f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.30f, 0.33f, 0.36f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.49f, 0.73f, 0.98f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.49f, 0.73f, 0.98f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.62f, 0.80f, 0.98f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.17f, 0.19f, 0.23f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.22f, 0.27f, 0.35f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.28f, 0.34f, 0.43f, 1.00f);
+    colors[ImGuiCol_Header] = ImVec4(0.16f, 0.19f, 0.23f, 1.00f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.22f, 0.27f, 0.35f, 1.00f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.27f, 0.32f, 0.41f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.31f, 0.34f, 0.39f, 1.00f);
+    colors[ImGuiCol_Tab] = ImVec4(0.12f, 0.14f, 0.18f, 1.00f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.24f, 0.31f, 0.40f, 1.00f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.18f, 0.23f, 0.30f, 1.00f);
+    colors[ImGuiCol_DockingPreview] = ImVec4(0.45f, 0.71f, 0.97f, 0.60f);
+
+    style.WindowRounding = 2.0f;
+    style.FrameRounding = 2.0f;
+    style.GrabRounding = 2.0f;
+    style.ScrollbarRounding = 2.0f;
+    style.TabRounding = 2.0f;
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 1.0f;
+
+    if (_stricmp(densitySetting.c_str(), "cozy") == 0) {
+        style.WindowPadding = ImVec2(10.0f, 8.0f);
+        style.FramePadding = ImVec2(8.0f, 5.0f);
+        style.ItemSpacing = ImVec2(8.0f, 6.0f);
+        style.CellPadding = ImVec2(8.0f, 6.0f);
+    } else {
+        style.WindowPadding = ImVec2(7.0f, 6.0f);
+        style.FramePadding = ImVec2(6.0f, 3.0f);
+        style.ItemSpacing = ImVec2(6.0f, 4.0f);
+        style.CellPadding = ImVec2(6.0f, 4.0f);
+    }
+}
+
+struct TypedScanRow {
+    uintptr_t address = 0;
+    std::string value;
+};
+
+struct TypedScanJobResult {
     uint64_t jobId = 0;
-    DWORD pid = 0;
-    std::vector<uintptr_t> results;
+    core::TypedScanSession session;
     std::string error;
     uint64_t elapsedMs = 0;
 };
 
-struct CaptureDirectoryScanResult {
+struct PatternScanJobResult {
     uint64_t jobId = 0;
-    std::wstring outputDirectory;
+    std::vector<uintptr_t> addresses;
+    std::string error;
+    uint64_t elapsedMs = 0;
+};
+
+struct CaptureScanJobResult {
+    uint64_t jobId = 0;
     std::vector<std::filesystem::path> textures;
     std::vector<std::filesystem::path> models;
-    bool logResult = false;
-    uint64_t elapsedMs = 0;
     std::string error;
+    uint64_t elapsedMs = 0;
+    bool logResult = false;
 };
 
-class MainWindow {
+struct WatchEntry {
+    uint64_t id = 0;
+    uintptr_t address = 0;
+    core::TypedScanValueType type = core::TypedScanValueType::Int32;
+    size_t byteSize = 4;
+    bool freeze = false;
+    std::array<char, 64> label{};
+    std::array<char, 128> freezeValue{};
+    std::string currentValue;
+    std::string status;
+    std::chrono::steady_clock::time_point nextPoll{};
+    std::chrono::steady_clock::time_point nextFreeze{};
+};
+
+class RipperForgeApp {
 public:
-    bool Create(HINSTANCE instance) {
-        instance_ = instance;
-
-        WNDCLASSEXW windowClass{};
-        windowClass.cbSize = sizeof(windowClass);
-        windowClass.style = CS_HREDRAW | CS_VREDRAW;
-        windowClass.lpfnWndProc = &MainWindow::WindowProcSetup;
-        windowClass.hInstance = instance_;
-        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        windowClass.hbrBackground = darkBrush_;
-        windowClass.lpszClassName = kWindowClassName;
-
-        if (!RegisterClassExW(&windowClass)) {
-            return false;
-        }
-
-        hwnd_ = CreateWindowExW(
-            0,
-            kWindowClassName,
-            kWindowTitle,
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1400,
-            860,
-            nullptr,
-            nullptr,
-            instance_,
-            this);
-
-        if (hwnd_ == nullptr) {
-            return false;
-        }
-
-        ShowWindow(hwnd_, SW_SHOWDEFAULT);
-        UpdateWindow(hwnd_);
-        return true;
-    }
-
-    int Run() {
-        MSG message{};
-        while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-
-        return static_cast<int>(message.wParam);
-    }
+    bool Initialize(HINSTANCE instance);
+    int Run();
+    ~RipperForgeApp();
+    const std::string& InitFailureReason() const { return initFailureReason_; }
 
 private:
-    static LRESULT CALLBACK WindowProcSetup(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-        if (message == WM_NCCREATE) {
-            const auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
-            auto* self = reinterpret_cast<MainWindow*>(createStruct->lpCreateParams);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-            self->hwnd_ = hwnd;
-            return self->WindowProc(message, wParam, lParam);
-        }
-
-        auto* self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-        if (self != nullptr) {
-            return self->WindowProc(message, wParam, lParam);
-        }
-
-        return DefWindowProcW(hwnd, message, wParam, lParam);
-    }
-
-    LRESULT WindowProc(UINT message, WPARAM wParam, LPARAM lParam) {
-        if (message == WM_NCCREATE) {
-            return TRUE;
-        }
-        switch (message) {
-        case WM_CREATE:
-            OnCreate();
-            return 0;
-        case WM_SIZE:
-            OnSize();
-            return 0;
-        case WM_COMMAND:
-            OnCommand(wParam);
-            return 0;
-        case WM_NOTIFY:
-            return OnNotify(lParam);
-        case WM_TIMER:
-            OnTimer(wParam);
-            return 0;
-        case kMessageMemoryScanComplete:
-            OnMemoryScanCompleted(reinterpret_cast<MemoryScanJobResult*>(lParam));
-            return 0;
-        case kMessageCaptureScanComplete:
-            OnCaptureScanCompleted(reinterpret_cast<CaptureDirectoryScanResult*>(lParam));
-            return 0;
-        case WM_CTLCOLORSTATIC:
-        case WM_CTLCOLOREDIT:
-        case WM_CTLCOLORLISTBOX:
-            return OnControlColor(wParam, lParam);
-        case WM_DESTROY:
-            OnDestroy();
-            PostQuitMessage(0);
-            return 0;
-        default:
-            return DefWindowProcW(hwnd_, message, wParam, lParam);
-        }
-    }
-
-    void OnCreate() {
-        EnableDarkTitleBar();
-
-        core::Logger::Instance().SetCallback([this](const std::string& line) {
-            AppendLog(Utf8ToWide(line));
-        });
-
-        const std::wstring exeDir = GetModuleDirectory();
-        configPath_ = (std::filesystem::path(exeDir) / L"config" / L"settings.json").wstring();
-        pluginDir_ = (std::filesystem::path(exeDir) / L"plugins").wstring();
-
-        settings_ = core::LoadSettings(configPath_);
-        if (settings_.hookBackend.empty()) {
-            settings_.hookBackend = L"MinHook";
-        }
-
-        CreateGlobalControls();
-        CreateTabPages();
-        LayoutControls();
-
-        assetBridge_.Initialize(exeDir);
-        if (settings_.captureDllPath.empty()) {
-            settings_.captureDllPath = assetBridge_.CaptureDllPath();
-        }
-        if (settings_.captureOutputDir.empty()) {
-            settings_.captureOutputDir = assetBridge_.OutputDirectory();
-        }
-
-        SetWindowTextW(searchEdit_, settings_.processFilter.c_str());
-        SetWindowTextW(dllPathEdit_, settings_.lastDllPath.c_str());
-        SetWindowTextW(captureDllEdit_, settings_.captureDllPath.c_str());
-        SetWindowTextW(captureOutputEdit_, settings_.captureOutputDir.c_str());
-        SetWindowTextW(hookDllEdit_, settings_.hookDllPath.c_str());
-        Button_SetCheck(autoRefreshCheckbox_, settings_.autoRefresh ? BST_CHECKED : BST_UNCHECKED);
-        SelectHookBackend(settings_.hookBackend);
-
-        assetBridge_.SetCaptureDllPath(settings_.captureDllPath);
-        assetBridge_.SetOutputDirectory(settings_.captureOutputDir);
-
-        RefreshProcessList(true);
-        RequestCaptureScan(false);
-
-        std::string previewError;
-        if (previewRenderer_.Initialize(assetPreviewHost_, previewError)) {
-            previewInitialized_ = true;
-            if (!settings_.lastTextureAssetPath.empty() && std::filesystem::exists(settings_.lastTextureAssetPath)) {
-                LoadTextureAsset(settings_.lastTextureAssetPath);
-            }
-            if (!settings_.lastModelAssetPath.empty() && std::filesystem::exists(settings_.lastModelAssetPath)) {
-                LoadModelAsset(settings_.lastModelAssetPath);
-            }
-        } else {
-            core::Logger::Instance().Error("DX11 preview init failed: " + previewError);
-        }
-
-        SetTimer(hwnd_, kProcessRefreshTimerId, std::max<UINT>(500, settings_.refreshIntervalMs), nullptr);
-        SetTimer(hwnd_, kCaptureProgressTimerId, 120, nullptr);
-        SetTimer(hwnd_, kPreviewRenderTimerId, 16, nullptr);
-
-        pluginManager_.Reload(pluginDir_);
-        RefreshPluginList();
-
-        core::Logger::Instance().Info("RipperForge initialized.");
-        if (!core::IsRunningAsAdmin()) {
-            core::Logger::Instance().Info("Run as administrator for reliable injection into protected processes.");
-        }
-    }
-
-    void OnDestroy() {
-        shuttingDown_ = true;
-        if (memoryScanCancelToken_) {
-            memoryScanCancelToken_->store(true);
-        }
-
-        KillTimer(hwnd_, kProcessRefreshTimerId);
-        KillTimer(hwnd_, kCaptureProgressTimerId);
-        KillTimer(hwnd_, kPreviewRenderTimerId);
-
-        settings_.processFilter = GetWindowTextString(searchEdit_);
-        settings_.lastDllPath = GetWindowTextString(dllPathEdit_);
-        settings_.captureDllPath = GetWindowTextString(captureDllEdit_);
-        settings_.captureOutputDir = GetWindowTextString(captureOutputEdit_);
-        settings_.hookDllPath = GetWindowTextString(hookDllEdit_);
-        settings_.hookBackend = GetHookBackend();
-        settings_.autoRefresh = Button_GetCheck(autoRefreshCheckbox_) == BST_CHECKED;
-
-        assetBridge_.StopCapture();
-        previewRenderer_.Shutdown();
-        previewInitialized_ = false;
-
-        core::SaveSettings(configPath_, settings_);
-        pluginManager_.UnloadAll();
-        core::Logger::Instance().SetCallback(nullptr);
-
-        if (uiFont_ != nullptr) {
-            DeleteObject(uiFont_);
-            uiFont_ = nullptr;
-        }
-
-        if (darkBrush_ != nullptr) {
-            DeleteObject(darkBrush_);
-            darkBrush_ = nullptr;
-        }
-
-        if (inputBrush_ != nullptr) {
-            DeleteObject(inputBrush_);
-            inputBrush_ = nullptr;
-        }
-    }
-
-    void EnableDarkTitleBar() {
-        constexpr DWORD dwmUseImmersiveDarkMode = 20;
-        const BOOL enabled = TRUE;
-        DwmSetWindowAttribute(hwnd_, dwmUseImmersiveDarkMode, &enabled, sizeof(enabled));
-    }
-
-    void CreateGlobalControls() {
-        uiFont_ = CreateFontW(
-            -18,
-            0,
-            0,
-            0,
-            FW_NORMAL,
-            FALSE,
-            FALSE,
-            FALSE,
-            DEFAULT_CHARSET,
-            OUT_OUTLINE_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            DEFAULT_PITCH,
-            L"Bahnschrift");
-
-        searchEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0,
-            0,
-            100,
-            24,
-            hwnd_,
-            reinterpret_cast<HMENU>(IDC_SEARCH_EDIT),
-            instance_,
-            nullptr);
-
-        refreshButton_ = CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Refresh",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            90,
-            24,
-            hwnd_,
-            reinterpret_cast<HMENU>(IDC_REFRESH_BUTTON),
-            instance_,
-            nullptr);
-
-        autoRefreshCheckbox_ = CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Auto Refresh",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            0,
-            0,
-            120,
-            24,
-            hwnd_,
-            reinterpret_cast<HMENU>(IDC_AUTO_REFRESH),
-            instance_,
-            nullptr);
-
-        elevateButton_ = CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Elevate",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            90,
-            24,
-            hwnd_,
-            reinterpret_cast<HMENU>(IDC_ELEVATE_BUTTON),
-            instance_,
-            nullptr);
-
-        processList_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_LISTVIEWW,
-            L"",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-            0,
-            0,
-            100,
-            100,
-            hwnd_,
-            reinterpret_cast<HMENU>(IDC_PROCESS_LIST),
-            instance_,
-            nullptr);
-
-        ListView_SetExtendedListViewStyle(processList_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
-        AddProcessColumns();
-
-        tabControl_ = CreateWindowExW(
-            0,
-            WC_TABCONTROLW,
-            L"",
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-            0,
-            0,
-            300,
-            300,
-            hwnd_,
-            reinterpret_cast<HMENU>(IDC_TAB_CONTROL),
-            instance_,
-            nullptr);
-
-        ApplyFontRecursively(hwnd_);
-    }
-
-    void AddProcessColumns() {
-        LVCOLUMNW column{};
-        column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-
-        column.pszText = const_cast<LPWSTR>(L"Process");
-        column.cx = 180;
-        column.iSubItem = 0;
-        ListView_InsertColumn(processList_, 0, &column);
-
-        column.pszText = const_cast<LPWSTR>(L"PID");
-        column.cx = 85;
-        column.iSubItem = 1;
-        ListView_InsertColumn(processList_, 1, &column);
-
-        column.pszText = const_cast<LPWSTR>(L"Path");
-        column.cx = 600;
-        column.iSubItem = 2;
-        ListView_InsertColumn(processList_, 2, &column);
-    }
-
-    void CreateTabPages() {
-        constexpr std::array<const wchar_t*, static_cast<size_t>(TabIndex::Count)> tabNames = {
-            L"Injector",
-            L"Memory",
-            L"Asset Ripper",
-            L"Hooks",
-            L"Plugins",
-            L"Logs",
-        };
-
-        for (size_t i = 0; i < tabNames.size(); ++i) {
-            TCITEMW item{};
-            item.mask = TCIF_TEXT;
-            item.pszText = const_cast<LPWSTR>(tabNames[i]);
-            TabCtrl_InsertItem(tabControl_, static_cast<int>(i), &item);
-
-            pageWindows_[i] = CreateWindowExW(
-                0,
-                WC_STATICW,
-                L"",
-                WS_CHILD | (i == 0 ? WS_VISIBLE : 0),
-                0,
-                0,
-                100,
-                100,
-                tabControl_,
-                nullptr,
-                instance_,
-                nullptr);
-        }
-
-        CreateInjectorTab(pageWindows_[static_cast<size_t>(TabIndex::Injector)]);
-        CreateMemoryTab(pageWindows_[static_cast<size_t>(TabIndex::Memory)]);
-        CreateAssetTab(pageWindows_[static_cast<size_t>(TabIndex::AssetRipper)]);
-        CreateHookTab(pageWindows_[static_cast<size_t>(TabIndex::Hooks)]);
-        CreatePluginTab(pageWindows_[static_cast<size_t>(TabIndex::Plugins)]);
-        CreateLogTab(pageWindows_[static_cast<size_t>(TabIndex::Logs)]);
-
-        ApplyFontRecursively(tabControl_);
-    }
-
-    void CreateInjectorTab(HWND parent) {
-        CreateWindowExW(0, WC_STATICW, L"DLL to Inject", WS_CHILD | WS_VISIBLE, 0, 0, 100, 20, parent, nullptr, instance_, nullptr);
-
-        dllPathEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0,
-            0,
-            100,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_DLL_PATH_EDIT),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Browse",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            90,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_DLL_BROWSE_BUTTON),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Inject Selected Process",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            190,
-            30,
-            parent,
-            reinterpret_cast<HMENU>(IDC_DLL_INJECT_BUTTON),
-            instance_,
-            nullptr);
-    }
-
-    void CreateMemoryTab(HWND parent) {
-        CreateWindowExW(0, WC_STATICW, L"Address (hex)", WS_CHILD | WS_VISIBLE, 0, 0, 120, 20, parent, nullptr, instance_, nullptr);
-
-        memAddressEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0,
-            0,
-            160,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_MEM_ADDRESS_EDIT),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Read",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            80,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_MEM_READ_BUTTON),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(0, WC_STATICW, L"Bytes (hex)", WS_CHILD | WS_VISIBLE, 0, 0, 120, 20, parent, nullptr, instance_, nullptr);
-
-        memBytesEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0,
-            0,
-            360,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_MEM_BYTES_EDIT),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Write",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            80,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_MEM_WRITE_BUTTON),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(0, WC_STATICW, L"Pattern (e.g. 48 8B ?? ??)", WS_CHILD | WS_VISIBLE, 0, 0, 190, 20, parent, nullptr, instance_, nullptr);
-
-        memPatternEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0,
-            0,
-            360,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_MEM_PATTERN_EDIT),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Scan",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            80,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_MEM_SCAN_BUTTON),
-            instance_,
-            nullptr);
-
-        memResultsList_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_LISTBOXW,
-            L"",
-            WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL,
-            0,
-            0,
-            300,
-            200,
-            parent,
-            reinterpret_cast<HMENU>(IDC_MEM_RESULT_LIST),
-            instance_,
-            nullptr);
-    }
-
-    void CreateAssetTab(HWND parent) {
-        CreateWindowExW(
-            0,
-            WC_STATICW,
-            L"AssetRIpper capture bridge: inject ripper DLL + monitor output assets with live DX11 preview.",
-            WS_CHILD | WS_VISIBLE,
-            0,
-            0,
-            760,
-            20,
-            parent,
-            nullptr,
-            instance_,
-            nullptr);
-
-        CreateWindowExW(0, WC_STATICW, L"Capture DLL", WS_CHILD | WS_VISIBLE, 0, 0, 100, 20, parent, nullptr, instance_, nullptr);
-        captureDllEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0,
-            0,
-            360,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_DLL_EDIT),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Browse",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            90,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_DLL_BROWSE),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(0, WC_STATICW, L"Output Dir", WS_CHILD | WS_VISIBLE, 0, 0, 100, 20, parent, nullptr, instance_, nullptr);
-        captureOutputEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0,
-            0,
-            360,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_OUTPUT_EDIT),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Browse",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            90,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_OUTPUT_BROWSE),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Start Batch Capture",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            170,
-            30,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_START_BUTTON),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Stop",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            80,
-            30,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_STOP_BUTTON),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Scan Assets",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            100,
-            30,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_SCAN_BUTTON),
-            instance_,
-            nullptr);
-
-        captureProgress_ = CreateWindowExW(
-            0,
-            PROGRESS_CLASSW,
-            L"",
-            WS_CHILD | WS_VISIBLE,
-            0,
-            0,
-            500,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_PROGRESS),
-            instance_,
-            nullptr);
-        SendMessageW(captureProgress_, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-
-        CreateWindowExW(0, WC_STATICW, L"Textures", WS_CHILD | WS_VISIBLE, 0, 0, 80, 20, parent, nullptr, instance_, nullptr);
-        assetTextureList_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_LISTBOXW,
-            L"",
-            WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL,
-            0,
-            0,
-            300,
-            120,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_TEXTURE_LIST),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(0, WC_STATICW, L"Models", WS_CHILD | WS_VISIBLE, 0, 0, 80, 20, parent, nullptr, instance_, nullptr);
-        assetModelList_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_LISTBOXW,
-            L"",
-            WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL,
-            0,
-            0,
-            300,
-            120,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_MODEL_LIST),
-            instance_,
-            nullptr);
-
-        assetPreviewHost_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_STATICW,
-            L"",
-            WS_CHILD | WS_VISIBLE,
-            0,
-            0,
-            320,
-            260,
-            parent,
-            reinterpret_cast<HMENU>(IDC_CAPTURE_PREVIEW_HOST),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Export Preview (.png)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            170,
-            28,
-            parent,
-            reinterpret_cast<HMENU>(IDC_EXPORT_PNG_BUTTON),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Export Mesh (.obj)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            170,
-            28,
-            parent,
-            reinterpret_cast<HMENU>(IDC_EXPORT_OBJ_BUTTON),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Export Mesh (.fbx)",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            170,
-            28,
-            parent,
-            reinterpret_cast<HMENU>(IDC_EXPORT_FBX_BUTTON),
-            instance_,
-            nullptr);
-    }
-
-    void CreateHookTab(HWND parent) {
-        CreateWindowExW(0, WC_STATICW, L"Engine", WS_CHILD | WS_VISIBLE, 0, 0, 120, 20, parent, nullptr, instance_, nullptr);
-
-        hookEngineCombo_ = CreateWindowExW(
-            0,
-            WC_COMBOBOXW,
-            L"",
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-            0,
-            0,
-            220,
-            200,
-            parent,
-            reinterpret_cast<HMENU>(IDC_HOOK_ENGINE_COMBO),
-            instance_,
-            nullptr);
-
-        ComboBox_AddString(hookEngineCombo_, L"Unity");
-        ComboBox_AddString(hookEngineCombo_, L"Source");
-        ComboBox_AddString(hookEngineCombo_, L"Unreal");
-        ComboBox_SetCurSel(hookEngineCombo_, 0);
-
-        CreateWindowExW(0, WC_STATICW, L"Hook Backend", WS_CHILD | WS_VISIBLE, 0, 0, 120, 20, parent, nullptr, instance_, nullptr);
-        hookBackendCombo_ = CreateWindowExW(
-            0,
-            WC_COMBOBOXW,
-            L"",
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-            0,
-            0,
-            220,
-            120,
-            parent,
-            reinterpret_cast<HMENU>(IDC_HOOK_BACKEND_COMBO),
-            instance_,
-            nullptr);
-        ComboBox_AddString(hookBackendCombo_, L"MinHook");
-        ComboBox_AddString(hookBackendCombo_, L"Detours");
-        ComboBox_SetCurSel(hookBackendCombo_, 0);
-
-        CreateWindowExW(0, WC_STATICW, L"Hook DLL path", WS_CHILD | WS_VISIBLE, 0, 0, 120, 20, parent, nullptr, instance_, nullptr);
-
-        hookDllEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            0,
-            0,
-            450,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_HOOK_DLL_EDIT),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Browse",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            90,
-            24,
-            parent,
-            reinterpret_cast<HMENU>(IDC_HOOK_DLL_BROWSE),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Generate Template",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            160,
-            30,
-            parent,
-            reinterpret_cast<HMENU>(IDC_HOOK_GEN_TEMPLATE),
-            instance_,
-            nullptr);
-
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Inject Hook DLL",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            140,
-            30,
-            parent,
-            reinterpret_cast<HMENU>(IDC_HOOK_INJECT),
-            instance_,
-            nullptr);
-    }
-
-    void CreatePluginTab(HWND parent) {
-        CreateWindowExW(
-            0,
-            WC_BUTTONW,
-            L"Reload Plugins",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0,
-            0,
-            140,
-            30,
-            parent,
-            reinterpret_cast<HMENU>(IDC_PLUGIN_RELOAD_BUTTON),
-            instance_,
-            nullptr);
-
-        pluginList_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_LISTBOXW,
-            L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL,
-            0,
-            0,
-            400,
-            300,
-            parent,
-            reinterpret_cast<HMENU>(IDC_PLUGIN_LIST),
-            instance_,
-            nullptr);
-    }
-
-    void CreateLogTab(HWND parent) {
-        logEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            WC_EDITW,
-            L"",
-            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
-            0,
-            0,
-            400,
-            300,
-            parent,
-            reinterpret_cast<HMENU>(IDC_LOG_EDIT),
-            instance_,
-            nullptr);
-
-        const auto snapshot = core::Logger::Instance().Snapshot();
-        for (const auto& line : snapshot) {
-            AppendLog(Utf8ToWide(line));
-        }
-    }
-
-    void LayoutControls() {
-        RECT rect{};
-        GetClientRect(hwnd_, &rect);
-
-        const int clientWidth = rect.right - rect.left;
-        const int clientHeight = rect.bottom - rect.top;
-
-        const int margin = 12;
-        const int topRowHeight = 30;
-        const int leftPanelWidth = std::clamp(clientWidth / 3, 320, 520);
-
-        const int searchWidth = std::max(150, leftPanelWidth - 260);
-        MoveWindow(searchEdit_, margin, margin, searchWidth, 24, TRUE);
-        MoveWindow(refreshButton_, margin + searchWidth + 8, margin, 80, 24, TRUE);
-        MoveWindow(autoRefreshCheckbox_, margin + searchWidth + 96, margin, 110, 24, TRUE);
-        MoveWindow(elevateButton_, margin + leftPanelWidth - 92, margin, 90, 24, TRUE);
-
-        MoveWindow(
-            processList_,
-            margin,
-            margin + topRowHeight + 4,
-            leftPanelWidth,
-            clientHeight - (margin * 2 + topRowHeight + 4),
-            TRUE);
-
-        const int rightX = margin + leftPanelWidth + margin;
-        const int rightWidth = std::max(300, clientWidth - rightX - margin);
-        const int rightHeight = std::max(200, clientHeight - margin * 2);
-
-        MoveWindow(tabControl_, rightX, margin, rightWidth, rightHeight, TRUE);
-
-        RECT tabRect{};
-        GetClientRect(tabControl_, &tabRect);
-        TabCtrl_AdjustRect(tabControl_, FALSE, &tabRect);
-
-        for (HWND page : pageWindows_) {
-            MoveWindow(page, tabRect.left, tabRect.top, tabRect.right - tabRect.left, tabRect.bottom - tabRect.top, TRUE);
-        }
-
-        LayoutInjectorPage();
-        LayoutMemoryPage();
-        LayoutAssetPage();
-        LayoutHookPage();
-        LayoutPluginPage();
-        LayoutLogPage();
-    }
-
-    void LayoutInjectorPage() {
-        HWND page = pageWindows_[static_cast<size_t>(TabIndex::Injector)];
-        RECT rect{};
-        GetClientRect(page, &rect);
-
-        const int margin = 12;
-        const int width = rect.right - rect.left;
-
-        const HWND label = GetWindow(page, GW_CHILD);
-        MoveWindow(label, margin, margin, 120, 20, TRUE);
-
-        MoveWindow(dllPathEdit_, margin, margin + 24, width - 240, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_DLL_BROWSE_BUTTON), width - 220, margin + 24, 90, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_DLL_INJECT_BUTTON), margin, margin + 64, 220, 30, TRUE);
-    }
-
-    void LayoutMemoryPage() {
-        HWND page = pageWindows_[static_cast<size_t>(TabIndex::Memory)];
-        RECT rect{};
-        GetClientRect(page, &rect);
-
-        const int margin = 12;
-        const int width = rect.right - rect.left;
-        const int height = rect.bottom - rect.top;
-
-        HWND child = GetWindow(page, GW_CHILD);
-        MoveWindow(child, margin, margin, 120, 20, TRUE);
-
-        MoveWindow(memAddressEdit_, margin, margin + 22, 200, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_MEM_READ_BUTTON), margin + 210, margin + 22, 80, 24, TRUE);
-
-        child = GetWindow(child, GW_HWNDNEXT);
-        child = GetWindow(child, GW_HWNDNEXT);
-        child = GetWindow(child, GW_HWNDNEXT);
-        MoveWindow(child, margin, margin + 54, 120, 20, TRUE);
-
-        MoveWindow(memBytesEdit_, margin, margin + 76, width - 160, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_MEM_WRITE_BUTTON), width - 140, margin + 76, 80, 24, TRUE);
-
-        child = GetWindow(child, GW_HWNDNEXT);
-        child = GetWindow(child, GW_HWNDNEXT);
-        child = GetWindow(child, GW_HWNDNEXT);
-        MoveWindow(child, margin, margin + 110, 210, 20, TRUE);
-
-        MoveWindow(memPatternEdit_, margin, margin + 132, width - 160, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_MEM_SCAN_BUTTON), width - 140, margin + 132, 80, 24, TRUE);
-
-        MoveWindow(memResultsList_, margin, margin + 166, width - margin * 2, height - (margin + 178), TRUE);
-    }
-
-    void LayoutAssetPage() {
-        HWND page = pageWindows_[static_cast<size_t>(TabIndex::AssetRipper)];
-        RECT rect{};
-        GetClientRect(page, &rect);
-
-        const int margin = 12;
-        const int width = rect.right - rect.left;
-        const int height = rect.bottom - rect.top;
-
-        const int leftWidth = std::clamp(width / 2, 360, 460);
-        const int rightX = margin + leftWidth + margin;
-        const int rightWidth = std::max(200, width - rightX - margin);
-
-        HWND child = GetWindow(page, GW_CHILD);
-        MoveWindow(child, margin, margin, width - margin * 2, 20, TRUE); // description
-
-        child = GetWindow(child, GW_HWNDNEXT); // capture dll label
-        MoveWindow(child, margin, margin + 28, 100, 20, TRUE);
-        MoveWindow(captureDllEdit_, margin, margin + 48, leftWidth - 100, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_CAPTURE_DLL_BROWSE), margin + leftWidth - 92, margin + 48, 90, 24, TRUE);
-
-        child = GetWindow(child, GW_HWNDNEXT); // capture dll edit
-        child = GetWindow(child, GW_HWNDNEXT); // capture dll browse
-        child = GetWindow(child, GW_HWNDNEXT); // output dir label
-        MoveWindow(child, margin, margin + 76, 100, 20, TRUE);
-        MoveWindow(captureOutputEdit_, margin, margin + 96, leftWidth - 100, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_CAPTURE_OUTPUT_BROWSE), margin + leftWidth - 92, margin + 96, 90, 24, TRUE);
-
-        MoveWindow(GetDlgItem(page, IDC_CAPTURE_START_BUTTON), margin, margin + 128, 150, 30, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_CAPTURE_STOP_BUTTON), margin + 158, margin + 128, 80, 30, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_CAPTURE_SCAN_BUTTON), margin + 244, margin + 128, 100, 30, TRUE);
-
-        MoveWindow(captureProgress_, margin, margin + 166, leftWidth, 22, TRUE);
-
-        child = GetWindow(child, GW_HWNDNEXT); // output edit
-        child = GetWindow(child, GW_HWNDNEXT); // output browse
-        child = GetWindow(child, GW_HWNDNEXT); // start
-        child = GetWindow(child, GW_HWNDNEXT); // stop
-        child = GetWindow(child, GW_HWNDNEXT); // scan
-        child = GetWindow(child, GW_HWNDNEXT); // progress
-        child = GetWindow(child, GW_HWNDNEXT); // textures label
-        MoveWindow(child, margin, margin + 194, 80, 20, TRUE);
-
-        const int listsTop = margin + 214;
-        const int listHeight = std::max(86, (height - listsTop - 120) / 2);
-        MoveWindow(assetTextureList_, margin, listsTop, leftWidth, listHeight, TRUE);
-
-        child = GetWindow(child, GW_HWNDNEXT); // texture list
-        child = GetWindow(child, GW_HWNDNEXT); // models label
-        MoveWindow(child, margin, listsTop + listHeight + 8, 80, 20, TRUE);
-        MoveWindow(assetModelList_, margin, listsTop + listHeight + 28, leftWidth, listHeight, TRUE);
-
-        const int previewTop = margin + 48;
-        const int previewHeight = std::max(160, height - previewTop - 100);
-        MoveWindow(assetPreviewHost_, rightX, previewTop, rightWidth, previewHeight, TRUE);
-
-        MoveWindow(GetDlgItem(page, IDC_EXPORT_PNG_BUTTON), rightX, previewTop + previewHeight + 12, 170, 28, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_EXPORT_OBJ_BUTTON), rightX + 178, previewTop + previewHeight + 12, 170, 28, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_EXPORT_FBX_BUTTON), rightX, previewTop + previewHeight + 44, 170, 28, TRUE);
-    }
-
-    void LayoutHookPage() {
-        HWND page = pageWindows_[static_cast<size_t>(TabIndex::Hooks)];
-        RECT rect{};
-        GetClientRect(page, &rect);
-
-        const int margin = 12;
-        const int width = rect.right - rect.left;
-
-        HWND child = GetWindow(page, GW_CHILD);
-        MoveWindow(child, margin, margin, 120, 20, TRUE);
-        MoveWindow(hookEngineCombo_, margin, margin + 22, 220, 24, TRUE);
-
-        child = GetWindow(child, GW_HWNDNEXT); // engine combo
-        child = GetWindow(child, GW_HWNDNEXT); // backend label
-        MoveWindow(child, margin, margin + 56, 120, 20, TRUE);
-        MoveWindow(hookBackendCombo_, margin, margin + 78, 220, 24, TRUE);
-
-        child = GetWindow(child, GW_HWNDNEXT); // backend combo
-        child = GetWindow(child, GW_HWNDNEXT); // hook dll label
-        MoveWindow(child, margin, margin + 110, 120, 20, TRUE);
-
-        MoveWindow(hookDllEdit_, margin, margin + 132, width - margin * 2 - 98, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_HOOK_DLL_BROWSE), width - margin - 90, margin + 132, 90, 24, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_HOOK_GEN_TEMPLATE), margin, margin + 166, 180, 30, TRUE);
-        MoveWindow(GetDlgItem(page, IDC_HOOK_INJECT), margin + 190, margin + 166, 150, 30, TRUE);
-    }
-
-    void LayoutPluginPage() {
-        HWND page = pageWindows_[static_cast<size_t>(TabIndex::Plugins)];
-        RECT rect{};
-        GetClientRect(page, &rect);
-
-        const int margin = 12;
-        const int width = rect.right - rect.left;
-        const int height = rect.bottom - rect.top;
-
-        MoveWindow(GetDlgItem(page, IDC_PLUGIN_RELOAD_BUTTON), margin, margin, 140, 30, TRUE);
-        MoveWindow(pluginList_, margin, margin + 40, width - margin * 2, height - margin * 2 - 40, TRUE);
-    }
-
-    void LayoutLogPage() {
-        HWND page = pageWindows_[static_cast<size_t>(TabIndex::Logs)];
-        RECT rect{};
-        GetClientRect(page, &rect);
-
-        const int margin = 12;
-        MoveWindow(logEdit_, margin, margin, rect.right - margin * 2, rect.bottom - margin * 2, TRUE);
-    }
-
-    void OnSize() {
-        if (tabControl_ != nullptr) {
-            LayoutControls();
-            if (previewInitialized_) {
-                previewRenderer_.Resize();
-            }
-        }
-    }
-
-    void OnCommand(WPARAM wParam) {
-        const int id = LOWORD(wParam);
-        const int code = HIWORD(wParam);
-
-        if (id == IDC_CAPTURE_TEXTURE_LIST && code == LBN_SELCHANGE) {
-            LoadSelectedTextureFromList();
-            return;
-        }
-        if (id == IDC_CAPTURE_MODEL_LIST && code == LBN_SELCHANGE) {
-            LoadSelectedModelFromList();
-            return;
-        }
-        if (id == IDC_HOOK_BACKEND_COMBO && code == CBN_SELCHANGE) {
-            settings_.hookBackend = GetHookBackend();
-            return;
-        }
-
-        switch (id) {
-        case IDC_REFRESH_BUTTON:
-            RefreshProcessList(true);
-            break;
-        case IDC_ELEVATE_BUTTON:
-            HandleElevationRequest();
-            break;
-        case IDC_AUTO_REFRESH:
-            settings_.autoRefresh = Button_GetCheck(autoRefreshCheckbox_) == BST_CHECKED;
-            break;
-        case IDC_DLL_BROWSE_BUTTON:
-            BrowseForDll(dllPathEdit_);
-            break;
-        case IDC_DLL_INJECT_BUTTON:
-            InjectFromControl(dllPathEdit_);
-            break;
-        case IDC_MEM_READ_BUTTON:
-            HandleMemoryRead();
-            break;
-        case IDC_MEM_WRITE_BUTTON:
-            HandleMemoryWrite();
-            break;
-        case IDC_MEM_SCAN_BUTTON:
-            BeginPatternScan();
-            break;
-        case IDC_CAPTURE_START_BUTTON:
-            StartCapture();
-            break;
-        case IDC_CAPTURE_STOP_BUTTON:
-            StopCapture();
-            break;
-        case IDC_CAPTURE_DLL_BROWSE:
-            BrowseForDll(captureDllEdit_);
-            break;
-        case IDC_CAPTURE_OUTPUT_BROWSE:
-            BrowseForDirectory(captureOutputEdit_);
-            break;
-        case IDC_CAPTURE_SCAN_BUTTON:
-            RequestCaptureScan(true);
-            break;
-        case IDC_EXPORT_PNG_BUTTON:
-            ExportCurrentTexturePng();
-            break;
-        case IDC_EXPORT_OBJ_BUTTON:
-            ExportCurrentMeshObj();
-            break;
-        case IDC_EXPORT_FBX_BUTTON:
-            ExportCurrentMeshFbx();
-            break;
-        case IDC_HOOK_GEN_TEMPLATE:
-            GenerateHookTemplate();
-            break;
-        case IDC_HOOK_DLL_BROWSE:
-            BrowseForDll(hookDllEdit_);
-            break;
-        case IDC_HOOK_INJECT:
-            InjectFromControl(hookDllEdit_);
-            break;
-        case IDC_PLUGIN_RELOAD_BUTTON:
-            pluginManager_.Reload(pluginDir_);
-            RefreshPluginList();
-            break;
-        default:
-            break;
-        }
-    }
-
-    LRESULT OnNotify(LPARAM lParam) {
-        const auto* notify = reinterpret_cast<LPNMHDR>(lParam);
-        if (notify->hwndFrom == tabControl_ && notify->code == TCN_SELCHANGE) {
-            const int selected = TabCtrl_GetCurSel(tabControl_);
-            for (size_t i = 0; i < pageWindows_.size(); ++i) {
-                ShowWindow(pageWindows_[i], i == static_cast<size_t>(selected) ? SW_SHOW : SW_HIDE);
-            }
-            if (previewInitialized_ && selected == static_cast<int>(TabIndex::AssetRipper)) {
-                previewRenderer_.Resize();
-            }
-            return 0;
-        }
-
-        return 0;
-    }
-
-    void OnTimer(WPARAM timerId) {
-        if (timerId == kProcessRefreshTimerId) {
-            if (Button_GetCheck(autoRefreshCheckbox_) == BST_CHECKED) {
-                RefreshProcessList();
-            }
-            return;
-        }
-
-        if (timerId == kCaptureProgressTimerId) {
-            if (assetBridge_.IsCaptureRunning()) {
-                const float bridgeProgress = assetBridge_.QueryCaptureProgress();
-                int progress = 0;
-                if (bridgeProgress >= 0.0f && bridgeProgress <= 1.0f) {
-                    progress = static_cast<int>(std::clamp(bridgeProgress, 0.0f, 1.0f) * 100.0f);
-                } else {
-                    progress = static_cast<int>(std::min<uint32_t>(95, lastCaptureAssetCount_));
-                }
-                SendMessageW(captureProgress_, PBM_SETPOS, progress, 0);
-
-                const ULONGLONG now = GetTickCount64();
-                if (!captureScanRunning_ && now - lastCaptureScanKickMs_ >= kAutoCaptureScanIntervalMs) {
-                    RequestCaptureScan(false);
-                }
-            } else if (captureRunning_) {
-                captureRunning_ = false;
-                SendMessageW(captureProgress_, PBM_SETPOS, 0, 0);
-                RequestCaptureScan(false);
-            }
-            return;
-        }
-
-        if (timerId == kPreviewRenderTimerId && previewInitialized_) {
-            previewRenderer_.Render(1.0f / 60.0f);
-        }
-    }
-
-    LRESULT OnControlColor(WPARAM wParam, LPARAM lParam) {
-        HDC dc = reinterpret_cast<HDC>(wParam);
-        HWND control = reinterpret_cast<HWND>(lParam);
-
-        SetBkColor(dc, RGB(20, 20, 24));
-        SetTextColor(dc, RGB(220, 220, 224));
-
-        const int id = GetDlgCtrlID(control);
-        if (id == IDC_SEARCH_EDIT || id == IDC_DLL_PATH_EDIT || id == IDC_MEM_ADDRESS_EDIT ||
-            id == IDC_MEM_BYTES_EDIT || id == IDC_MEM_PATTERN_EDIT || id == IDC_HOOK_DLL_EDIT ||
-            id == IDC_CAPTURE_DLL_EDIT || id == IDC_CAPTURE_OUTPUT_EDIT ||
-            id == IDC_LOG_EDIT || id == IDC_MEM_RESULT_LIST || id == IDC_PLUGIN_LIST ||
-            id == IDC_CAPTURE_TEXTURE_LIST || id == IDC_CAPTURE_MODEL_LIST) {
-            return reinterpret_cast<LRESULT>(inputBrush_);
-        }
-
-        return reinterpret_cast<LRESULT>(darkBrush_);
-    }
-
-    void HandleElevationRequest() {
-        if (core::IsRunningAsAdmin()) {
-            core::Logger::Instance().Info("Already running with elevated privileges.");
-            return;
-        }
-
-        if (!core::RelaunchAsAdmin()) {
-            core::Logger::Instance().Error("Elevation prompt failed.");
-            return;
-        }
-
-        core::Logger::Instance().Info("Relaunching as administrator.");
-        PostMessageW(hwnd_, WM_CLOSE, 0, 0);
-    }
-
-    void RefreshProcessList(bool logRefresh = false) {
-        const std::wstring filter = GetWindowTextString(searchEdit_);
-        settings_.processFilter = filter;
-        processes_ = core::EnumerateProcesses(filter);
-
-        ListView_DeleteAllItems(processList_);
-
-        int row = 0;
-        for (const auto& process : processes_) {
-            LVITEMW item{};
-            item.mask = LVIF_TEXT | LVIF_PARAM;
-            item.iItem = row;
-            item.iSubItem = 0;
-            item.pszText = const_cast<LPWSTR>(process.name.c_str());
-            item.lParam = static_cast<LPARAM>(process.pid);
-
-            const int inserted = ListView_InsertItem(processList_, &item);
-            if (inserted < 0) {
-                continue;
-            }
-
-            const std::wstring pidText = std::to_wstring(process.pid);
-            ListView_SetItemText(processList_, inserted, 1, const_cast<LPWSTR>(pidText.c_str()));
-            ListView_SetItemText(
-                processList_,
-                inserted,
-                2,
-                const_cast<LPWSTR>(process.imagePath.empty() ? L"" : process.imagePath.c_str()));
-
-            ++row;
-        }
-
-        if (logRefresh) {
-            core::Logger::Instance().Info("Process list refreshed: " + std::to_string(processes_.size()) + " entries.");
-        }
-    }
-
-    DWORD GetSelectedPid() const {
-        const int selected = ListView_GetNextItem(processList_, -1, LVNI_SELECTED);
-        if (selected < 0) {
-            return 0;
-        }
-
-        LVITEMW item{};
-        item.mask = LVIF_PARAM;
-        item.iItem = selected;
-        if (!ListView_GetItem(processList_, &item)) {
-            return 0;
-        }
-
-        return static_cast<DWORD>(item.lParam);
-    }
-
-    void BrowseForDll(HWND targetEdit) {
-        wchar_t fileBuffer[MAX_PATH]{};
-
-        OPENFILENAMEW openFile{};
-        openFile.lStructSize = sizeof(openFile);
-        openFile.hwndOwner = hwnd_;
-        openFile.lpstrFilter = L"DLL Files (*.dll)\0*.dll\0All Files (*.*)\0*.*\0";
-        openFile.lpstrFile = fileBuffer;
-        openFile.nMaxFile = MAX_PATH;
-        openFile.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-
-        if (!GetOpenFileNameW(&openFile)) {
-            return;
-        }
-
-        SetWindowTextW(targetEdit, fileBuffer);
-        if (targetEdit == dllPathEdit_) {
-            settings_.lastDllPath = fileBuffer;
-        } else if (targetEdit == captureDllEdit_) {
-            settings_.captureDllPath = fileBuffer;
-            assetBridge_.SetCaptureDllPath(settings_.captureDllPath);
-        } else if (targetEdit == hookDllEdit_) {
-            settings_.hookDllPath = fileBuffer;
-        }
-    }
-
-    void BrowseForDirectory(HWND targetEdit) {
-        BROWSEINFOW browseInfo{};
-        browseInfo.hwndOwner = hwnd_;
-        browseInfo.lpszTitle = L"Select directory";
-        browseInfo.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-
-        PIDLIST_ABSOLUTE itemList = SHBrowseForFolderW(&browseInfo);
-        if (itemList == nullptr) {
-            return;
-        }
-
-        wchar_t path[MAX_PATH]{};
-        if (SHGetPathFromIDListW(itemList, path)) {
-            SetWindowTextW(targetEdit, path);
-            if (targetEdit == captureOutputEdit_) {
-                settings_.captureOutputDir = path;
-                assetBridge_.SetOutputDirectory(settings_.captureOutputDir);
-            }
-        }
-
-        CoTaskMemFree(itemList);
-    }
-
-    bool PromptSavePath(const wchar_t* filter, const wchar_t* defaultExtension, const std::wstring& initialName, std::wstring& outPath) {
-        wchar_t fileBuffer[MAX_PATH]{};
-        if (!initialName.empty()) {
-            wcsncpy_s(fileBuffer, initialName.c_str(), _TRUNCATE);
-        }
-
-        OPENFILENAMEW saveFile{};
-        saveFile.lStructSize = sizeof(saveFile);
-        saveFile.hwndOwner = hwnd_;
-        saveFile.lpstrFilter = filter;
-        saveFile.lpstrFile = fileBuffer;
-        saveFile.nMaxFile = MAX_PATH;
-        saveFile.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-        saveFile.lpstrDefExt = defaultExtension;
-
-        if (!GetSaveFileNameW(&saveFile)) {
-            return false;
-        }
-
-        outPath = fileBuffer;
-        return true;
-    }
-
-    void InjectFromControl(HWND editControl) {
-        const DWORD pid = GetSelectedPid();
-        if (pid == 0) {
-            core::Logger::Instance().Error("Select a target process first.");
-            return;
-        }
-
-        const std::wstring dllPath = GetWindowTextString(editControl);
-        if (dllPath.empty()) {
-            core::Logger::Instance().Error("DLL path is empty.");
-            return;
-        }
-
-        std::string error;
-        if (!core::InjectDll(pid, dllPath, error)) {
-            core::Logger::Instance().Error("Injection failed: " + error);
-            return;
-        }
-
-        if (editControl == dllPathEdit_) {
-            settings_.lastDllPath = dllPath;
-        } else if (editControl == hookDllEdit_) {
-            settings_.hookDllPath = dllPath;
-            core::Logger::Instance().Info("Injected hook DLL using backend template: " + WideToUtf8(GetHookBackend()));
-        }
-
-        core::Logger::Instance().Info("Injection succeeded for PID " + std::to_string(pid) + ".");
-    }
-
-    std::string AddressToHex(uintptr_t value) const {
-        std::ostringstream stream;
-        stream << std::hex << std::uppercase << value;
-        return stream.str();
-    }
-
-    void HandleMemoryRead() {
-        const DWORD pid = GetSelectedPid();
-        if (pid == 0) {
-            core::Logger::Instance().Error("Select a process before memory operations.");
-            return;
-        }
-
-        uintptr_t address = 0;
-        if (!ParseHexAddress(GetWindowTextString(memAddressEdit_), address)) {
-            core::Logger::Instance().Error("Invalid address format.");
-            return;
-        }
-
-        std::vector<uint8_t> requestedBytes;
-        ParseHexByteList(GetWindowTextString(memBytesEdit_), requestedBytes);
-        const size_t readSize = requestedBytes.empty() ? 16 : requestedBytes.size();
-
-        std::vector<uint8_t> data;
-        std::string error;
-        if (!core::ReadMemory(pid, address, readSize, data, error)) {
-            core::Logger::Instance().Error("Read failed: " + error);
-            return;
-        }
-
-        SetWindowTextW(memBytesEdit_, BytesToHexString(data).c_str());
-        core::Logger::Instance().Info("Read " + std::to_string(data.size()) + " bytes from 0x" + AddressToHex(address));
-    }
-
-    void HandleMemoryWrite() {
-        const DWORD pid = GetSelectedPid();
-        if (pid == 0) {
-            core::Logger::Instance().Error("Select a process before memory operations.");
-            return;
-        }
-
-        uintptr_t address = 0;
-        if (!ParseHexAddress(GetWindowTextString(memAddressEdit_), address)) {
-            core::Logger::Instance().Error("Invalid address format.");
-            return;
-        }
-
-        std::vector<uint8_t> bytes;
-        if (!ParseHexByteList(GetWindowTextString(memBytesEdit_), bytes) || bytes.empty()) {
-            core::Logger::Instance().Error("Invalid byte list. Example: 90 90 90");
-            return;
-        }
-
-        std::string error;
-        if (!core::WriteMemory(pid, address, bytes, error)) {
-            core::Logger::Instance().Error("Write failed: " + error);
-            return;
-        }
-
-        core::Logger::Instance().Info("Wrote " + std::to_string(bytes.size()) + " bytes to 0x" + AddressToHex(address));
-    }
-
-    void SetMemoryScanUiState(bool running) {
-        HWND button = GetDlgItem(pageWindows_[static_cast<size_t>(TabIndex::Memory)], IDC_MEM_SCAN_BUTTON);
-        if (button == nullptr) {
-            return;
-        }
-
-        EnableWindow(button, running ? FALSE : TRUE);
-        SetWindowTextW(button, running ? L"Scanning..." : L"Scan");
-    }
-
-    void BeginPatternScan() {
-        if (memoryScanRunning_) {
-            core::Logger::Instance().Info("Memory scan is already running.");
-            return;
-        }
-
-        const DWORD pid = GetSelectedPid();
-        if (pid == 0) {
-            core::Logger::Instance().Error("Select a process before scanning.");
-            return;
-        }
-
-        std::vector<int> pattern;
-        std::string error;
-        if (!core::ParsePattern(WideToUtf8(GetWindowTextString(memPatternEdit_)), pattern, error)) {
-            core::Logger::Instance().Error("Pattern parse failed: " + error);
-            return;
-        }
-
-        SYSTEM_INFO systemInfo{};
-        GetSystemInfo(&systemInfo);
-
-        const uintptr_t start = reinterpret_cast<uintptr_t>(systemInfo.lpMinimumApplicationAddress);
-        const uintptr_t end = reinterpret_cast<uintptr_t>(systemInfo.lpMaximumApplicationAddress);
-
-        SendMessageW(memResultsList_, LB_RESETCONTENT, 0, 0);
-        SendMessageW(memResultsList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"<scan in progress...>"));
-
-        memoryScanRunning_ = true;
-        SetMemoryScanUiState(true);
-
-        memoryScanCancelToken_ = std::make_shared<std::atomic_bool>(false);
-        const uint64_t jobId = ++memoryScanJobCounter_;
-        activeMemoryScanJobId_ = jobId;
-
-        const HWND targetWindow = hwnd_;
-        auto cancelToken = memoryScanCancelToken_;
-        const std::string patternText = WideToUtf8(GetWindowTextString(memPatternEdit_));
-        core::Logger::Instance().Info("Scanning memory asynchronously: pattern \"" + patternText + "\"");
-
-        std::thread([targetWindow, jobId, pid, start, end, pattern = std::move(pattern), cancelToken]() mutable {
-            auto* result = new MemoryScanJobResult();
-            result->jobId = jobId;
-            result->pid = pid;
-
-            const auto begin = std::chrono::steady_clock::now();
-            result->results = core::ScanPattern(pid, start, end, pattern, 256, result->error, cancelToken.get());
-            const auto elapsed = std::chrono::steady_clock::now() - begin;
-            result->elapsedMs = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
-
-            if (!PostMessageW(targetWindow, kMessageMemoryScanComplete, 0, reinterpret_cast<LPARAM>(result))) {
-                delete result;
-            }
-        }).detach();
-    }
-
-    void OnMemoryScanCompleted(MemoryScanJobResult* rawResult) {
-        std::unique_ptr<MemoryScanJobResult> result(rawResult);
-        if (!result) {
-            return;
-        }
-        if (shuttingDown_) {
-            return;
-        }
-
-        if (result->jobId != activeMemoryScanJobId_) {
-            return;
-        }
-
-        memoryScanRunning_ = false;
-        SetMemoryScanUiState(false);
-
-        if (result->error == "Scan canceled.") {
-            core::Logger::Instance().Info("Memory scan canceled.");
-            return;
-        }
-
-        if (!result->error.empty()) {
-            core::Logger::Instance().Error("Scan failed: " + result->error);
-            return;
-        }
-
-        SendMessageW(memResultsList_, LB_RESETCONTENT, 0, 0);
-        for (const auto address : result->results) {
-            const std::wstring line = L"0x" + Utf8ToWide(AddressToHex(address));
-            SendMessageW(memResultsList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
-        }
-        if (result->results.empty()) {
-            SendMessageW(memResultsList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"<no matches>"));
-        }
-
-        core::Logger::Instance().Info(
-            "Pattern scan complete: " + std::to_string(result->results.size()) +
-            " hits in " + std::to_string(result->elapsedMs) + " ms.");
-    }
-
-    void StartCapture() {
-        const DWORD pid = GetSelectedPid();
-        if (pid == 0) {
-            core::Logger::Instance().Error("Select a process before starting capture.");
-            return;
-        }
-
-        settings_.captureDllPath = GetWindowTextString(captureDllEdit_);
-        settings_.captureOutputDir = GetWindowTextString(captureOutputEdit_);
-        if (settings_.captureDllPath.empty()) {
-            core::Logger::Instance().Error("Capture DLL path is empty.");
-            return;
-        }
-        if (settings_.captureOutputDir.empty()) {
-            core::Logger::Instance().Error("Capture output directory is empty.");
-            return;
-        }
-
-        assetBridge_.SetCaptureDllPath(settings_.captureDllPath);
-        assetBridge_.SetOutputDirectory(settings_.captureOutputDir);
-
-        std::string error;
-        if (!assetBridge_.StartCapture(pid, error)) {
-            core::Logger::Instance().Error("Capture start failed: " + error);
-            return;
-        }
-
-        captureRunning_ = true;
-        lastCaptureAssetCount_ = 0;
-        lastCaptureScanKickMs_ = 0;
-        SendMessageW(captureProgress_, PBM_SETPOS, 0, 0);
-        core::Logger::Instance().Info("AssetRIpper capture started for PID " + std::to_string(pid) + ".");
-        RequestCaptureScan(false);
-    }
-
-    void StopCapture() {
-        assetBridge_.StopCapture();
-        captureRunning_ = false;
-        SendMessageW(captureProgress_, PBM_SETPOS, 0, 0);
-        core::Logger::Instance().Info("Capture stopped.");
-        RequestCaptureScan(false);
-    }
-
-    void SetCaptureScanUiState(bool running) {
-        HWND button = GetDlgItem(pageWindows_[static_cast<size_t>(TabIndex::AssetRipper)], IDC_CAPTURE_SCAN_BUTTON);
-        if (button == nullptr) {
-            return;
-        }
-
-        EnableWindow(button, running ? FALSE : TRUE);
-        SetWindowTextW(button, running ? L"Scanning..." : L"Scan Assets");
-    }
-
-    void ApplyCaptureAssetLists(bool logResult) {
-        lastCaptureAssetCount_ = static_cast<uint32_t>(capturedTextureAssets_.size() + capturedModelAssets_.size());
-
-        SendMessageW(assetTextureList_, LB_RESETCONTENT, 0, 0);
-        for (const auto& path : capturedTextureAssets_) {
-            const std::wstring display = path.filename().wstring();
-            SendMessageW(assetTextureList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(display.c_str()));
-        }
-        if (capturedTextureAssets_.empty()) {
-            SendMessageW(assetTextureList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"<no texture assets found>"));
-        }
-
-        SendMessageW(assetModelList_, LB_RESETCONTENT, 0, 0);
-        for (const auto& path : capturedModelAssets_) {
-            const std::wstring display = path.filename().wstring();
-            SendMessageW(assetModelList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(display.c_str()));
-        }
-        if (capturedModelAssets_.empty()) {
-            SendMessageW(assetModelList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"<no model assets found>"));
-        }
-
-        if (logResult) {
-            core::Logger::Instance().Info(
-                "Capture scan: " + std::to_string(capturedTextureAssets_.size()) + " textures, " +
-                std::to_string(capturedModelAssets_.size()) + " models.");
-        }
-    }
-
-    void RequestCaptureScan(bool logResult) {
-        if (captureScanRunning_) {
-            queuedCaptureScan_ = true;
-            queuedCaptureScanLog_ = queuedCaptureScanLog_ || logResult;
-            if (logResult) {
-                core::Logger::Instance().Info("Capture scan queued. Current scan still running.");
-            }
-            return;
-        }
-
-        settings_.captureOutputDir = GetWindowTextString(captureOutputEdit_);
-        assetBridge_.SetOutputDirectory(settings_.captureOutputDir);
-
-        const std::wstring outputDir = settings_.captureOutputDir;
-        if (outputDir.empty()) {
-            core::Logger::Instance().Error("Capture output directory is empty.");
-            return;
-        }
-
-        captureScanRunning_ = true;
-        queuedCaptureScan_ = false;
-        queuedCaptureScanLog_ = false;
-        SetCaptureScanUiState(true);
-
-        lastCaptureScanKickMs_ = GetTickCount64();
-        const uint64_t jobId = ++captureScanJobCounter_;
-        activeCaptureScanJobId_ = jobId;
-        const HWND targetWindow = hwnd_;
-
-        if (logResult) {
-            core::Logger::Instance().Info("Scanning capture output asynchronously...");
-        }
-
-        std::thread([targetWindow, jobId, outputDir, logResult]() {
-            auto* result = new CaptureDirectoryScanResult();
-            result->jobId = jobId;
-            result->outputDirectory = outputDir;
-            result->logResult = logResult;
-
-            const auto begin = std::chrono::steady_clock::now();
-
-            try {
-                constexpr std::array<const wchar_t*, 8> kTextureExtensions = {
-                    L".dds", L".png", L".jpg", L".jpeg", L".bmp", L".tif", L".tiff", L".gif",
-                };
-                constexpr std::array<const wchar_t*, 8> kModelExtensions = {
-                    L".obj", L".fbx", L".glb", L".gltf", L".ply", L".stl", L".dae", L".x",
-                };
-
-                result->textures = EnumerateFilesWithExtensions(outputDir, kTextureExtensions);
-                result->models = EnumerateFilesWithExtensions(outputDir, kModelExtensions);
-            } catch (const std::exception& ex) {
-                result->error = ex.what();
-            }
-
-            const auto elapsed = std::chrono::steady_clock::now() - begin;
-            result->elapsedMs = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
-
-            if (!PostMessageW(targetWindow, kMessageCaptureScanComplete, 0, reinterpret_cast<LPARAM>(result))) {
-                delete result;
-            }
-        }).detach();
-    }
-
-    void OnCaptureScanCompleted(CaptureDirectoryScanResult* rawResult) {
-        std::unique_ptr<CaptureDirectoryScanResult> result(rawResult);
-        if (!result) {
-            return;
-        }
-        if (shuttingDown_) {
-            return;
-        }
-
-        if (result->jobId != activeCaptureScanJobId_) {
-            return;
-        }
-
-        captureScanRunning_ = false;
-        SetCaptureScanUiState(false);
-
-        if (!result->error.empty()) {
-            core::Logger::Instance().Error("Capture scan failed: " + result->error);
-        } else {
-            capturedTextureAssets_ = std::move(result->textures);
-            capturedModelAssets_ = std::move(result->models);
-            ApplyCaptureAssetLists(result->logResult);
-
-            if (result->logResult) {
-                core::Logger::Instance().Info("Capture scan finished in " + std::to_string(result->elapsedMs) + " ms.");
-            }
-        }
-
-        if (queuedCaptureScan_) {
-            const bool queuedLog = queuedCaptureScanLog_;
-            queuedCaptureScan_ = false;
-            queuedCaptureScanLog_ = false;
-            RequestCaptureScan(queuedLog);
-        }
-    }
-
-    void LoadTextureAsset(const std::wstring& path) {
-        std::string error;
-        core::TextureData texture;
-        if (!core::LoadTextureFromFile(path, texture, error)) {
-            core::Logger::Instance().Error("Texture load failed: " + error);
-            return;
-        }
-
-        if (previewInitialized_) {
-            if (!previewRenderer_.SetTexture(texture, error)) {
-                core::Logger::Instance().Error("DX11 texture upload failed: " + error);
-                return;
-            }
-            previewRenderer_.SetMode(core::PreviewMode::Texture);
-        }
-
-        currentTexture_ = std::move(texture);
-        settings_.lastTextureAssetPath = path;
-        core::Logger::Instance().Info("Texture loaded: " + WideToUtf8(path));
-    }
-
-    void LoadModelAsset(const std::wstring& path) {
-        std::string error;
-        core::MeshData mesh;
-        if (!core::LoadMeshFromObj(path, mesh, error)) {
-            core::Logger::Instance().Error("Model load failed: " + error + " (preview currently supports OBJ input)");
-            return;
-        }
-
-        if (previewInitialized_) {
-            if (!previewRenderer_.SetMesh(mesh, error)) {
-                core::Logger::Instance().Error("DX11 mesh upload failed: " + error);
-                return;
-            }
-            previewRenderer_.SetMode(core::PreviewMode::Model);
-        }
-
-        currentMesh_ = std::move(mesh);
-        settings_.lastModelAssetPath = path;
-        core::Logger::Instance().Info("Model loaded: " + WideToUtf8(path));
-    }
-
-    void LoadSelectedTextureFromList() {
-        const int selected = static_cast<int>(SendMessageW(assetTextureList_, LB_GETCURSEL, 0, 0));
-        if (selected < 0 || static_cast<size_t>(selected) >= capturedTextureAssets_.size()) {
-            return;
-        }
-        LoadTextureAsset(capturedTextureAssets_[static_cast<size_t>(selected)].wstring());
-    }
-
-    void LoadSelectedModelFromList() {
-        const int selected = static_cast<int>(SendMessageW(assetModelList_, LB_GETCURSEL, 0, 0));
-        if (selected < 0 || static_cast<size_t>(selected) >= capturedModelAssets_.size()) {
-            return;
-        }
-        LoadModelAsset(capturedModelAssets_[static_cast<size_t>(selected)].wstring());
-    }
-
-    void ExportCurrentTexturePng() {
-        if (currentTexture_.rgba8.empty()) {
-            core::Logger::Instance().Error("No texture is loaded.");
-            return;
-        }
-
-        std::wstring defaultName = L"capture_texture.png";
-        if (!currentTexture_.sourcePath.empty()) {
-            defaultName = std::filesystem::path(currentTexture_.sourcePath).stem().wstring() + L".png";
-        }
-
-        std::wstring outputPath;
-        if (!PromptSavePath(
-                L"PNG Image (*.png)\0*.png\0All Files (*.*)\0*.*\0",
-                L"png",
-                defaultName,
-                outputPath)) {
-            return;
-        }
-
-        std::string error;
-        if (!core::SaveTextureToPng(outputPath, currentTexture_, error)) {
-            core::Logger::Instance().Error("PNG export failed: " + error);
-            return;
-        }
-
-        core::Logger::Instance().Info("PNG exported: " + WideToUtf8(outputPath));
-    }
-
-    void ExportCurrentMeshObj() {
-        if (currentMesh_.vertices.empty() || currentMesh_.indices.empty()) {
-            core::Logger::Instance().Error("No mesh is loaded.");
-            return;
-        }
-
-        std::wstring defaultName = L"capture_mesh.obj";
-        if (!currentMesh_.sourcePath.empty()) {
-            defaultName = std::filesystem::path(currentMesh_.sourcePath).stem().wstring() + L".obj";
-        }
-
-        std::wstring outputPath;
-        if (!PromptSavePath(
-                L"Wavefront OBJ (*.obj)\0*.obj\0All Files (*.*)\0*.*\0",
-                L"obj",
-                defaultName,
-                outputPath)) {
-            return;
-        }
-
-        std::string error;
-        if (!core::SaveMeshToObj(outputPath, currentMesh_, error)) {
-            core::Logger::Instance().Error("OBJ export failed: " + error);
-            return;
-        }
-
-        core::Logger::Instance().Info("OBJ exported: " + WideToUtf8(outputPath));
-    }
-
-    void ExportCurrentMeshFbx() {
-        if (currentMesh_.vertices.empty() || currentMesh_.indices.empty()) {
-            core::Logger::Instance().Error("No mesh is loaded.");
-            return;
-        }
-
-        std::wstring defaultName = L"capture_mesh.fbx";
-        if (!currentMesh_.sourcePath.empty()) {
-            defaultName = std::filesystem::path(currentMesh_.sourcePath).stem().wstring() + L".fbx";
-        }
-
-        std::wstring outputPath;
-        if (!PromptSavePath(
-                L"Autodesk FBX (*.fbx)\0*.fbx\0All Files (*.*)\0*.*\0",
-                L"fbx",
-                defaultName,
-                outputPath)) {
-            return;
-        }
-
-        std::string error;
-        if (!core::SaveMeshToFbxAscii(outputPath, currentMesh_, error)) {
-            core::Logger::Instance().Error("FBX export failed: " + error);
-            return;
-        }
-
-        core::Logger::Instance().Info("FBX exported: " + WideToUtf8(outputPath));
-    }
-
-    std::wstring GetHookBackend() const {
-        const int selection = ComboBox_GetCurSel(hookBackendCombo_);
-        if (selection < 0) {
-            return L"MinHook";
-        }
-
-        wchar_t backend[64]{};
-        ComboBox_GetLBText(hookBackendCombo_, selection, backend);
-        return backend;
-    }
-
-    void SelectHookBackend(const std::wstring& backend) {
-        const int count = ComboBox_GetCount(hookBackendCombo_);
-        for (int i = 0; i < count; ++i) {
-            wchar_t item[64]{};
-            ComboBox_GetLBText(hookBackendCombo_, i, item);
-            if (_wcsicmp(item, backend.c_str()) == 0) {
-                ComboBox_SetCurSel(hookBackendCombo_, i);
-                return;
-            }
-        }
-        ComboBox_SetCurSel(hookBackendCombo_, 0);
-    }
-
-    void GenerateHookTemplate() {
-        const int engineSelection = ComboBox_GetCurSel(hookEngineCombo_);
-        if (engineSelection < 0) {
-            core::Logger::Instance().Error("Select an engine first.");
-            return;
-        }
-
-        wchar_t engine[64]{};
-        ComboBox_GetLBText(hookEngineCombo_, engineSelection, engine);
-        const std::wstring backend = GetHookBackend();
-
-        std::filesystem::path outputDir = std::filesystem::path(GetModuleDirectory()) / L"hooks" /
-            (std::wstring(engine) + L"_" + backend);
-        std::error_code errorCode;
-        std::filesystem::create_directories(outputDir, errorCode);
-        if (errorCode) {
-            core::Logger::Instance().Error("Could not create hooks directory.");
-            return;
-        }
-
-        std::filesystem::path outputPath = outputDir / (std::wstring(engine) + L"HookTemplate.cpp");
-        std::ofstream stream(outputPath, std::ios::binary | std::ios::trunc);
-        if (!stream.good()) {
-            core::Logger::Instance().Error("Failed to create hook template file.");
-            return;
-        }
-
-        stream << "// Generated by RipperForge\n";
-        stream << "// Engine: " << WideToUtf8(engine) << "\n\n";
-        stream << "#include <Windows.h>\n";
-
-        if (_wcsicmp(backend.c_str(), L"Detours") == 0) {
-            stream << "#include <detours.h>\n\n";
-            stream << "static decltype(&Sleep) g_originalSleep = &Sleep;\n\n";
-            stream << "VOID WINAPI HookedSleep(DWORD ms) {\n";
-            stream << "    g_originalSleep(ms);\n";
-            stream << "}\n\n";
-            stream << "bool InstallHooks() {\n";
-            stream << "    if (DetourTransactionBegin() != NO_ERROR) return false;\n";
-            stream << "    if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR) return false;\n";
-            stream << "    if (DetourAttach(&(PVOID&)g_originalSleep, HookedSleep) != NO_ERROR) return false;\n";
-            stream << "    return DetourTransactionCommit() == NO_ERROR;\n";
-            stream << "}\n\n";
-            stream << "void RemoveHooks() {\n";
-            stream << "    DetourTransactionBegin();\n";
-            stream << "    DetourUpdateThread(GetCurrentThread());\n";
-            stream << "    DetourDetach(&(PVOID&)g_originalSleep, HookedSleep);\n";
-            stream << "    DetourTransactionCommit();\n";
-            stream << "}\n\n";
-        } else {
-            stream << "#include <MinHook.h>\n\n";
-            stream << "static decltype(&Sleep) g_originalSleep = &Sleep;\n\n";
-            stream << "VOID WINAPI HookedSleep(DWORD ms) {\n";
-            stream << "    g_originalSleep(ms);\n";
-            stream << "}\n\n";
-            stream << "bool InstallHooks() {\n";
-            stream << "    if (MH_Initialize() != MH_OK) return false;\n";
-            stream << "    if (MH_CreateHook(&Sleep, &HookedSleep, reinterpret_cast<LPVOID*>(&g_originalSleep)) != MH_OK) return false;\n";
-            stream << "    return MH_EnableHook(MH_ALL_HOOKS) == MH_OK;\n";
-            stream << "}\n\n";
-            stream << "void RemoveHooks() {\n";
-            stream << "    MH_DisableHook(MH_ALL_HOOKS);\n";
-            stream << "    MH_Uninitialize();\n";
-            stream << "}\n\n";
-        }
-
-        stream << "BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {\n";
-        stream << "    if (reason == DLL_PROCESS_ATTACH) {\n";
-        stream << "        DisableThreadLibraryCalls(module);\n";
-        stream << "        InstallHooks();\n";
-        stream << "    } else if (reason == DLL_PROCESS_DETACH) {\n";
-        stream << "        RemoveHooks();\n";
-        stream << "    }\n";
-        stream << "    return TRUE;\n";
-        stream << "}\n";
-
-        std::filesystem::path notesPath = outputDir / L"build_notes.txt";
-        std::ofstream notes(notesPath, std::ios::binary | std::ios::trunc);
-        if (notes.good()) {
-            notes << "Backend: " << WideToUtf8(backend) << "\n";
-            notes << "1) Add include/lib paths for " << WideToUtf8(backend) << ".\n";
-            notes << "2) Build as x64 DLL.\n";
-            notes << "3) Set built DLL path in RipperForge Hook tab and click Inject Hook DLL.\n";
-            if (_wcsicmp(backend.c_str(), L"Detours") == 0) {
-                notes << "Expected headers/libs: detours.h + detours.lib\n";
-            } else {
-                notes << "Expected headers/libs: MinHook.h + libMinHook.x64.lib\n";
-            }
-        }
-
-        settings_.hookBackend = backend;
-        settings_.hookDllPath = (outputDir / (std::wstring(engine) + L"Hook.dll")).wstring();
-        SetWindowTextW(hookDllEdit_, settings_.hookDllPath.c_str());
-        core::Logger::Instance().Info("Hook template created (" + WideToUtf8(backend) + "): " + WideToUtf8(outputPath.wstring()));
-        core::Logger::Instance().Info("Build notes: " + WideToUtf8(notesPath.wstring()));
-    }
-
-    void RefreshPluginList() {
-        SendMessageW(pluginList_, LB_RESETCONTENT, 0, 0);
-
-        const auto& plugins = pluginManager_.Plugins();
-        for (const auto& plugin : plugins) {
-            const std::wstring line = Utf8ToWide(plugin.name) + L"  (" + plugin.filePath + L")";
-            SendMessageW(pluginList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
-        }
-
-        if (plugins.empty()) {
-            SendMessageW(pluginList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"No plugins loaded."));
-        }
-
-        core::Logger::Instance().Info("Plugin catalog refreshed.");
-    }
-
-    void AppendLog(const std::wstring& line) {
-        if (logEdit_ == nullptr) {
-            pendingLogs_.push_back(line);
-            return;
-        }
-
-        for (const auto& pending : pendingLogs_) {
-            AppendLogLine(pending);
-        }
-        pendingLogs_.clear();
-
-        AppendLogLine(line);
-    }
-
-    void AppendLogLine(const std::wstring& line) {
-        const std::wstring withBreak = line + L"\r\n";
-        const int length = GetWindowTextLengthW(logEdit_);
-        SendMessageW(logEdit_, EM_SETSEL, length, length);
-        SendMessageW(logEdit_, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(withBreak.c_str()));
-    }
-
-    void ApplyFontRecursively(HWND parent) {
-        if (uiFont_ == nullptr) {
-            return;
-        }
-
-        SendMessageW(parent, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
-
-        HWND child = GetWindow(parent, GW_CHILD);
-        while (child != nullptr) {
-            SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
-            child = GetWindow(child, GW_HWNDNEXT);
-        }
-    }
+    static LRESULT CALLBACK WindowProcSetup(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT WindowProc(UINT message, WPARAM wParam, LPARAM lParam);
+
+    bool CreateMainWindow(HINSTANCE instance);
+    bool CreateD3D();
+    void CleanupD3D();
+    bool CreateRenderTarget();
+    void CleanupRenderTarget();
+
+    void LoadState();
+    void SaveState();
+    void EnsureDefaultScanRange();
+
+    void BeginFrame();
+    void EndFrame();
+    void RenderDockspaceAndPanels();
+    void BuildDefaultDockLayout(ImGuiID dockspaceId);
+
+    void RenderProcessPanel();
+    void RenderWorkspacePanel();
+    void RenderInjectorTab();
+    void RenderAssetRipperTab();
+    void RenderHookManagerTab();
+    void RenderReverseToolkitTab();
+    void RenderPluginsTab();
+    void RenderLogPanel();
+
+    void HandleHotkeys();
+
+    void RefreshProcessList(bool logRefresh);
+    DWORD SelectedPid() const;
+    bool InjectDllFromBuffer(const std::array<char, 1024>& pathBuffer, const char* contextLabel);
+
+    void StartCapture();
+    void StopCapture();
+    void RequestCaptureScan(bool logResult);
+    void PollCaptureScanJob();
+
+    void LoadTextureAsset(const std::filesystem::path& path);
+    void LoadModelAsset(const std::filesystem::path& path);
+    void ExportCurrentTexturePng();
+    void ExportCurrentMeshObj();
+    void ExportCurrentMeshFbx();
+
+    void GenerateHookTemplate();
+
+    void StartTypedScanFirst();
+    void StartTypedScanNext();
+    void CancelTypedScan();
+    void PollTypedScanJob();
+
+    void StartPatternScan();
+    void CancelPatternScan();
+    void PollPatternScanJob();
+
+    void ResolvePointerChainFromUi();
+    void AddSelectedScanResultToWatch();
+    void UpdateWatchList();
+
+    void PlacePreviewHost(const ImVec2& minScreen, const ImVec2& maxScreen);
 
 private:
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
+    HWND previewHost_ = nullptr;
 
-    HBRUSH darkBrush_ = CreateSolidBrush(RGB(20, 20, 24));
-    HBRUSH inputBrush_ = CreateSolidBrush(RGB(28, 28, 34));
-    HFONT uiFont_ = nullptr;
+    ComPtr<ID3D11Device> device_;
+    ComPtr<ID3D11DeviceContext> deviceContext_;
+    ComPtr<IDXGISwapChain> swapChain_;
+    ComPtr<ID3D11RenderTargetView> mainRenderTargetView_;
 
-    HWND searchEdit_ = nullptr;
-    HWND refreshButton_ = nullptr;
-    HWND autoRefreshCheckbox_ = nullptr;
-    HWND elevateButton_ = nullptr;
-    HWND processList_ = nullptr;
-    HWND tabControl_ = nullptr;
+    bool initialized_ = false;
+    bool done_ = false;
+    bool dockLayoutBuilt_ = false;
+    bool previewVisibleThisFrame_ = false;
+    bool previewReady_ = false;
+    bool showLogAutoScroll_ = true;
 
-    std::array<HWND, static_cast<size_t>(TabIndex::Count)> pageWindows_{};
+    std::wstring moduleDir_;
+    std::wstring configPath_;
+    std::wstring pluginDir_;
+    std::string imguiIniPathUtf8_;
 
-    HWND dllPathEdit_ = nullptr;
+    core::AppSettings settings_;
 
-    HWND memAddressEdit_ = nullptr;
-    HWND memBytesEdit_ = nullptr;
-    HWND memPatternEdit_ = nullptr;
-    HWND memResultsList_ = nullptr;
+    std::array<char, 256> processFilter_{};
+    std::array<char, 1024> injectDllPath_{};
+    std::array<char, 1024> captureDllPath_{};
+    std::array<char, 1024> captureOutputDir_{};
+    std::array<char, 1024> hookDllPath_{};
+    std::array<char, 256> typedScanValue_{};
+    std::array<char, 32> scanRangeStart_{};
+    std::array<char, 32> scanRangeEnd_{};
+    std::array<char, 256> patternScanInput_{};
+    std::array<char, 32> pointerBaseAddress_{};
+    std::array<char, 256> pointerOffsets_{};
+    std::array<char, 64> pointerResolvedAddress_{};
 
-    HWND captureDllEdit_ = nullptr;
-    HWND captureOutputEdit_ = nullptr;
-    HWND captureProgress_ = nullptr;
-    HWND assetTextureList_ = nullptr;
-    HWND assetModelList_ = nullptr;
-    HWND assetPreviewHost_ = nullptr;
+    int selectedProcessIndex_ = -1;
+    DWORD selectedPid_ = 0;
 
-    HWND hookEngineCombo_ = nullptr;
-    HWND hookDllEdit_ = nullptr;
-    HWND hookBackendCombo_ = nullptr;
+    bool autoRefreshProcesses_ = true;
+    uint32_t processRefreshIntervalMs_ = 2000;
+    std::chrono::steady_clock::time_point nextProcessRefresh_{};
 
-    HWND pluginList_ = nullptr;
-    HWND logEdit_ = nullptr;
-
+    int selectedHookEngine_ = 0;
+    int selectedHookBackend_ = 0;
     bool captureRunning_ = false;
-    bool previewInitialized_ = false;
-    bool shuttingDown_ = false;
-    bool memoryScanRunning_ = false;
+    std::chrono::steady_clock::time_point nextAutoCaptureScan_{};
+
+    int selectedTextureIndex_ = -1;
+    int selectedModelIndex_ = -1;
+
+    int typedScanTypeIndex_ = 0;
+    int typedScanCompareIndex_ = 0;
+    bool typedScanHasSession_ = false;
+    int selectedTypedResultIndex_ = -1;
+    core::TypedScanSession typedScanSession_{};
+    std::vector<TypedScanRow> typedScanRows_;
+    std::string typedScanStatusLine_;
+
+    bool typedScanRunning_ = false;
+    uint64_t typedScanJobCounter_ = 0;
+    uint64_t activeTypedScanJob_ = 0;
+    std::shared_ptr<std::atomic_bool> typedScanCancelToken_;
+    std::future<TypedScanJobResult> typedScanFuture_;
+
+    bool patternScanRunning_ = false;
+    uint64_t patternScanJobCounter_ = 0;
+    uint64_t activePatternScanJob_ = 0;
+    std::shared_ptr<std::atomic_bool> patternScanCancelToken_;
+    std::future<PatternScanJobResult> patternScanFuture_;
+    std::vector<uintptr_t> patternScanResults_;
+
     bool captureScanRunning_ = false;
     bool queuedCaptureScan_ = false;
     bool queuedCaptureScanLog_ = false;
-    uint32_t lastCaptureAssetCount_ = 0;
-    ULONGLONG lastCaptureScanKickMs_ = 0;
-    uint64_t memoryScanJobCounter_ = 0;
-    uint64_t activeMemoryScanJobId_ = 0;
     uint64_t captureScanJobCounter_ = 0;
-    uint64_t activeCaptureScanJobId_ = 0;
+    uint64_t activeCaptureScanJob_ = 0;
+    std::future<CaptureScanJobResult> captureScanFuture_;
 
-    std::wstring configPath_;
-    std::wstring pluginDir_;
+    std::vector<core::ProcessInfo> processes_;
+    std::vector<std::filesystem::path> capturedTextures_;
+    std::vector<std::filesystem::path> capturedModels_;
+    core::TextureData currentTexture_{};
+    core::MeshData currentMesh_{};
 
-    core::AppSettings settings_;
     core::AssetRipperBridge assetBridge_;
     core::Dx11PreviewRenderer previewRenderer_;
-    core::TextureData currentTexture_;
-    core::MeshData currentMesh_;
-    std::vector<std::filesystem::path> capturedTextureAssets_;
-    std::vector<std::filesystem::path> capturedModelAssets_;
-    std::vector<core::ProcessInfo> processes_;
-    std::vector<std::wstring> pendingLogs_;
-    std::shared_ptr<std::atomic_bool> memoryScanCancelToken_;
     plugins::PluginManager pluginManager_;
+
+    std::vector<WatchEntry> watchList_;
+    uint64_t watchIdCounter_ = 1;
+    uint32_t freezeIntervalMs_ = 120;
+
+    std::chrono::steady_clock::time_point lastFrameTime_{};
+    std::string initFailureReason_;
 };
+
+bool RipperForgeApp::CreateMainWindow(HINSTANCE instance) {
+    instance_ = instance;
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_CLASSDC;
+    wc.lpfnWndProc = &RipperForgeApp::WindowProcSetup;
+    wc.hInstance = instance_;
+    wc.lpszClassName = kWindowClassName;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+
+    if (!RegisterClassExW(&wc)) {
+        const DWORD errorCode = GetLastError();
+        if (errorCode != ERROR_CLASS_ALREADY_EXISTS) {
+            initFailureReason_ = "RegisterClassExW failed: " + Win32ErrorToString(errorCode);
+            return false;
+        }
+    }
+
+    hwnd_ = CreateWindowW(
+        kWindowClassName,
+        kWindowTitle,
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        1680,
+        980,
+        nullptr,
+        nullptr,
+        instance_,
+        this);
+
+    if (hwnd_ == nullptr) {
+        initFailureReason_ = "CreateWindowW failed: " + Win32ErrorToString(GetLastError());
+        return false;
+    }
+
+    return true;
+}
+
+bool RipperForgeApp::CreateD3D() {
+    DXGI_SWAP_CHAIN_DESC sd{};
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = 0;
+    sd.BufferDesc.Height = 0;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hwnd_;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    UINT createFlags = 0;
+#ifdef _DEBUG
+    createFlags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+
+    const D3D_FEATURE_LEVEL featureLevels[] = {
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+    D3D_FEATURE_LEVEL featureLevelOut = D3D_FEATURE_LEVEL_11_0;
+
+    HRESULT lastHr = E_FAIL;
+    auto tryCreateDevice = [&](D3D_DRIVER_TYPE driverType, UINT flags) -> bool {
+        swapChain_.Reset();
+        device_.Reset();
+        deviceContext_.Reset();
+
+        const HRESULT hr = D3D11CreateDeviceAndSwapChain(
+            nullptr,
+            driverType,
+            nullptr,
+            flags,
+            featureLevels,
+            static_cast<UINT>(std::size(featureLevels)),
+            D3D11_SDK_VERSION,
+            &sd,
+            swapChain_.GetAddressOf(),
+            device_.GetAddressOf(),
+            &featureLevelOut,
+            deviceContext_.GetAddressOf());
+
+        lastHr = hr;
+        return SUCCEEDED(hr);
+    };
+
+    bool created = tryCreateDevice(D3D_DRIVER_TYPE_HARDWARE, createFlags);
+    if (!created && (createFlags & D3D11_CREATE_DEVICE_DEBUG) != 0) {
+        created = tryCreateDevice(D3D_DRIVER_TYPE_HARDWARE, createFlags & ~D3D11_CREATE_DEVICE_DEBUG);
+    }
+    if (!created) {
+        created = tryCreateDevice(D3D_DRIVER_TYPE_WARP, createFlags & ~D3D11_CREATE_DEVICE_DEBUG);
+    }
+    if (!created) {
+        initFailureReason_ = "D3D11CreateDeviceAndSwapChain failed: " + HrToHex(lastHr);
+        return false;
+    }
+
+    if (!CreateRenderTarget()) {
+        initFailureReason_ = "CreateRenderTarget failed after D3D init.";
+        return false;
+    }
+
+    return true;
+}
+
+bool RipperForgeApp::CreateRenderTarget() {
+    ComPtr<ID3D11Texture2D> backBuffer;
+    if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf())))) {
+        return false;
+    }
+    if (FAILED(device_->CreateRenderTargetView(backBuffer.Get(), nullptr, mainRenderTargetView_.GetAddressOf()))) {
+        return false;
+    }
+    return mainRenderTargetView_ != nullptr;
+}
+
+void RipperForgeApp::CleanupRenderTarget() {
+    mainRenderTargetView_.Reset();
+}
+
+void RipperForgeApp::CleanupD3D() {
+    CleanupRenderTarget();
+    swapChain_.Reset();
+    deviceContext_.Reset();
+    device_.Reset();
+}
+
+bool RipperForgeApp::Initialize(HINSTANCE instance) {
+    initFailureReason_.clear();
+
+    if (!CreateMainWindow(instance)) {
+        if (initFailureReason_.empty()) {
+            initFailureReason_ = "CreateMainWindow failed.";
+        }
+        return false;
+    }
+    if (!CreateD3D()) {
+        if (initFailureReason_.empty()) {
+            initFailureReason_ = "CreateD3D failed.";
+        }
+        return false;
+    }
+
+    ShowWindow(hwnd_, SW_SHOWDEFAULT);
+    UpdateWindow(hwnd_);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+
+    moduleDir_ = GetModuleDirectory();
+    configPath_ = (std::filesystem::path(moduleDir_) / L"config" / L"settings.json").wstring();
+    pluginDir_ = (std::filesystem::path(moduleDir_) / L"plugins").wstring();
+    imguiIniPathUtf8_ = WideToUtf8((std::filesystem::path(moduleDir_) / L"config" / L"imgui_layout.ini").wstring());
+    io.IniFilename = imguiIniPathUtf8_.c_str();
+
+    if (!ImGui_ImplWin32_Init(hwnd_)) {
+        initFailureReason_ = "ImGui_ImplWin32_Init failed.";
+        return false;
+    }
+    if (!ImGui_ImplDX11_Init(device_.Get(), deviceContext_.Get())) {
+        initFailureReason_ = "ImGui_ImplDX11_Init failed.";
+        return false;
+    }
+
+    LoadState();
+
+    ApplyIndustrialTheme(WideToUtf8(settings_.uiDensity));
+
+    previewHost_ = CreateWindowExW(
+        WS_EX_NOPARENTNOTIFY,
+        L"STATIC",
+        L"",
+        WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        0,
+        0,
+        10,
+        10,
+        hwnd_,
+        nullptr,
+        instance_,
+        nullptr);
+
+    if (previewHost_ != nullptr) {
+        std::string previewError;
+        if (previewRenderer_.Initialize(previewHost_, previewError)) {
+            previewReady_ = true;
+            ShowWindow(previewHost_, SW_HIDE);
+        } else {
+            core::Logger::Instance().Error("DX11 preview init failed: " + previewError);
+            previewReady_ = false;
+        }
+    }
+
+    assetBridge_.Initialize(moduleDir_);
+    assetBridge_.SetCaptureDllPath(Utf8ToWide(BufferString(captureDllPath_)));
+    assetBridge_.SetOutputDirectory(Utf8ToWide(BufferString(captureOutputDir_)));
+
+    pluginManager_.Reload(pluginDir_);
+    RefreshProcessList(true);
+    RequestCaptureScan(false);
+
+    core::Logger::Instance().Info("ImGui docked UI initialized. Multi-viewport is disabled.");
+    if (!core::IsRunningAsAdmin()) {
+        core::Logger::Instance().Info("Run as administrator for reliable injection into protected processes.");
+    }
+
+    lastFrameTime_ = std::chrono::steady_clock::now();
+    nextProcessRefresh_ = lastFrameTime_ + std::chrono::milliseconds(processRefreshIntervalMs_);
+    nextAutoCaptureScan_ = lastFrameTime_ + std::chrono::milliseconds(kAutoCaptureScanIntervalMs);
+    initialized_ = true;
+    return true;
+}
+
+void RipperForgeApp::EnsureDefaultScanRange() {
+    if (BufferString(scanRangeStart_).empty() || BufferString(scanRangeEnd_).empty()) {
+        SYSTEM_INFO systemInfo{};
+        GetSystemInfo(&systemInfo);
+        SetBuffer(scanRangeStart_, FormatAddress(reinterpret_cast<uintptr_t>(systemInfo.lpMinimumApplicationAddress)));
+        SetBuffer(scanRangeEnd_, FormatAddress(reinterpret_cast<uintptr_t>(systemInfo.lpMaximumApplicationAddress)));
+    }
+}
+
+void RipperForgeApp::LoadState() {
+    settings_ = core::LoadSettings(configPath_);
+
+    autoRefreshProcesses_ = settings_.autoRefresh;
+    processRefreshIntervalMs_ = std::max<uint32_t>(500, settings_.refreshIntervalMs);
+    freezeIntervalMs_ = std::max<uint32_t>(30, settings_.reverseToolkitFreezeIntervalMs);
+
+    SetBuffer(processFilter_, settings_.processFilter);
+    SetBuffer(injectDllPath_, settings_.lastDllPath);
+    SetBuffer(captureDllPath_, settings_.captureDllPath);
+    SetBuffer(captureOutputDir_, settings_.captureOutputDir);
+    SetBuffer(hookDllPath_, settings_.hookDllPath);
+
+    typedScanTypeIndex_ = IndexFromType(TypeFromWString(settings_.reverseToolkitScanDefaults.valueType));
+    typedScanCompareIndex_ = IndexFromCompareMode(CompareFromWString(settings_.reverseToolkitScanDefaults.compareMode));
+    SetBuffer(typedScanValue_, settings_.reverseToolkitScanDefaults.valueInput);
+    SetBuffer(scanRangeStart_, settings_.reverseToolkitScanDefaults.rangeStartHex);
+    SetBuffer(scanRangeEnd_, settings_.reverseToolkitScanDefaults.rangeEndHex);
+    EnsureDefaultScanRange();
+
+    selectedHookBackend_ = (_wcsicmp(settings_.hookBackend.c_str(), L"Detours") == 0) ? 1 : 0;
+
+    if (BufferString(captureDllPath_).empty()) {
+        SetBuffer(captureDllPath_, L"ripper_new6.dll");
+    }
+    if (BufferString(captureOutputDir_).empty()) {
+        SetBuffer(captureOutputDir_, (std::filesystem::path(moduleDir_) / L"captures").wstring());
+    }
+
+    watchList_.clear();
+    for (const auto& persisted : settings_.reverseToolkitWatchList) {
+        WatchEntry entry;
+        entry.id = watchIdCounter_++;
+        entry.address = static_cast<uintptr_t>(persisted.address);
+        entry.type = TypeFromWString(persisted.valueType);
+        entry.byteSize = DefaultTypeByteSize(entry.type);
+        entry.freeze = persisted.freeze;
+        SetBuffer(entry.label, persisted.label.empty() ? Utf8ToWide(FormatAddress(entry.address)) : persisted.label);
+        SetBuffer(entry.freezeValue, persisted.freezeValue);
+        watchList_.push_back(entry);
+    }
+}
+
+void RipperForgeApp::SaveState() {
+    settings_.autoRefresh = autoRefreshProcesses_;
+    settings_.refreshIntervalMs = processRefreshIntervalMs_;
+    settings_.processFilter = Utf8ToWide(BufferString(processFilter_));
+    settings_.lastDllPath = Utf8ToWide(BufferString(injectDllPath_));
+    settings_.captureDllPath = Utf8ToWide(BufferString(captureDllPath_));
+    settings_.captureOutputDir = Utf8ToWide(BufferString(captureOutputDir_));
+    settings_.hookDllPath = Utf8ToWide(BufferString(hookDllPath_));
+    settings_.hookBackend = kHookBackends[static_cast<size_t>(selectedHookBackend_)];
+
+    settings_.uiLayout = L"dockspace-default";
+    if (settings_.uiTheme.empty()) {
+        settings_.uiTheme = L"industrial-dark";
+    }
+    if (settings_.uiDensity.empty()) {
+        settings_.uiDensity = L"compact";
+    }
+
+    settings_.reverseToolkitScanDefaults.valueType = TypeToWString(TypeFromIndex(typedScanTypeIndex_));
+    settings_.reverseToolkitScanDefaults.compareMode = CompareToWString(CompareModeFromIndex(typedScanCompareIndex_));
+    settings_.reverseToolkitScanDefaults.valueInput = Utf8ToWide(BufferString(typedScanValue_));
+    settings_.reverseToolkitScanDefaults.rangeStartHex = Utf8ToWide(BufferString(scanRangeStart_));
+    settings_.reverseToolkitScanDefaults.rangeEndHex = Utf8ToWide(BufferString(scanRangeEnd_));
+    settings_.reverseToolkitFreezeIntervalMs = freezeIntervalMs_;
+
+    settings_.reverseToolkitWatchList.clear();
+    for (const auto& entry : watchList_) {
+        core::ReverseToolkitWatchEntry persisted;
+        persisted.label = Utf8ToWide(BufferString(entry.label));
+        persisted.address = static_cast<uint64_t>(entry.address);
+        persisted.valueType = TypeToWString(entry.type);
+        persisted.freezeValue = Utf8ToWide(BufferString(entry.freezeValue));
+        persisted.freeze = entry.freeze;
+        settings_.reverseToolkitWatchList.push_back(std::move(persisted));
+    }
+
+    core::SaveSettings(configPath_, settings_);
+}
+
+RipperForgeApp::~RipperForgeApp() {
+    if (!initialized_) {
+        return;
+    }
+
+    done_ = true;
+
+    CancelTypedScan();
+    CancelPatternScan();
+
+    if (typedScanFuture_.valid()) {
+        typedScanFuture_.wait();
+    }
+    if (patternScanFuture_.valid()) {
+        patternScanFuture_.wait();
+    }
+    if (captureScanFuture_.valid()) {
+        captureScanFuture_.wait();
+    }
+
+    assetBridge_.StopCapture();
+    pluginManager_.UnloadAll();
+    SaveState();
+
+    if (previewReady_) {
+        previewRenderer_.Shutdown();
+    }
+    if (previewHost_ != nullptr) {
+        DestroyWindow(previewHost_);
+        previewHost_ = nullptr;
+    }
+
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+
+    CleanupD3D();
+
+    if (hwnd_ != nullptr) {
+        DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+    }
+    UnregisterClassW(kWindowClassName, instance_);
+}
+
+LRESULT CALLBACK RipperForgeApp::WindowProcSetup(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_NCCREATE) {
+        const auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        auto* self = reinterpret_cast<RipperForgeApp*>(createStruct->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
+    auto* self = reinterpret_cast<RipperForgeApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (self != nullptr) {
+        return self->WindowProc(message, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT RipperForgeApp::WindowProc(UINT message, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hwnd_, message, wParam, lParam)) {
+        return true;
+    }
+
+    switch (message) {
+    case WM_SIZE:
+        if (device_ != nullptr && wParam != SIZE_MINIMIZED) {
+            CleanupRenderTarget();
+            swapChain_->ResizeBuffers(0, static_cast<UINT>(LOWORD(lParam)), static_cast<UINT>(HIWORD(lParam)), DXGI_FORMAT_UNKNOWN, 0);
+            if (!CreateRenderTarget()) {
+                core::Logger::Instance().Error("Failed to recreate D3D render target after resize.");
+            }
+        }
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xfff0) == SC_KEYMENU) {
+            return 0;
+        }
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    default:
+        break;
+    }
+
+    return DefWindowProcW(hwnd_, message, wParam, lParam);
+}
+
+int RipperForgeApp::Run() {
+    MSG message{};
+    while (!done_) {
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+            if (message.message == WM_QUIT) {
+                done_ = true;
+            }
+        }
+        if (done_) {
+            break;
+        }
+
+        BeginFrame();
+        RenderDockspaceAndPanels();
+        EndFrame();
+    }
+
+    return static_cast<int>(message.wParam);
+}
+
+void RipperForgeApp::BeginFrame() {
+    const auto now = std::chrono::steady_clock::now();
+    const float deltaSeconds =
+        std::chrono::duration_cast<std::chrono::duration<float>>(now - lastFrameTime_).count();
+    lastFrameTime_ = now;
+
+    PollTypedScanJob();
+    PollPatternScanJob();
+    PollCaptureScanJob();
+    UpdateWatchList();
+
+    if (autoRefreshProcesses_ && now >= nextProcessRefresh_) {
+        RefreshProcessList(false);
+        nextProcessRefresh_ = now + std::chrono::milliseconds(processRefreshIntervalMs_);
+    }
+
+    if (captureRunning_ && now >= nextAutoCaptureScan_) {
+        RequestCaptureScan(false);
+        nextAutoCaptureScan_ = now + std::chrono::milliseconds(kAutoCaptureScanIntervalMs);
+    }
+
+    previewVisibleThisFrame_ = false;
+
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    HandleHotkeys();
+
+    if (previewReady_ && previewHost_ != nullptr && IsWindowVisible(previewHost_)) {
+        previewRenderer_.Render(std::max(0.0001f, deltaSeconds));
+    }
+}
+
+void RipperForgeApp::EndFrame() {
+    if (!previewVisibleThisFrame_ && previewHost_ != nullptr) {
+        ShowWindow(previewHost_, SW_HIDE);
+    }
+
+    ImGui::Render();
+    const float clearColor[4] = {0.07f, 0.08f, 0.10f, 1.0f};
+    deviceContext_->OMSetRenderTargets(1, mainRenderTargetView_.GetAddressOf(), nullptr);
+    deviceContext_->ClearRenderTargetView(mainRenderTargetView_.Get(), clearColor);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    swapChain_->Present(1, 0);
+}
+
+void RipperForgeApp::BuildDefaultDockLayout(ImGuiID dockspaceId) {
+    ImGui::DockBuilderRemoveNode(dockspaceId);
+    ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodeSize(dockspaceId, ImGui::GetMainViewport()->Size);
+
+    ImGuiID dockMain = dockspaceId;
+    ImGuiID dockLeft = 0;
+    ImGuiID dockBottom = 0;
+    ImGuiID dockRight = 0;
+
+    ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Left, 0.27f, &dockLeft, &dockRight);
+    ImGui::DockBuilderSplitNode(dockRight, ImGuiDir_Down, 0.28f, &dockBottom, &dockMain);
+
+    ImGui::DockBuilderDockWindow("Process Control", dockLeft);
+    ImGui::DockBuilderDockWindow("Workspace", dockMain);
+    ImGui::DockBuilderDockWindow("Log Console", dockBottom);
+
+    ImGui::DockBuilderFinish(dockspaceId);
+}
+
+void RipperForgeApp::RenderDockspaceAndPanels() {
+    const ImGuiWindowFlags hostWindowFlags =
+        ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_MenuBar;
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin("RipperForgeHost", nullptr, hostWindowFlags);
+    ImGui::PopStyleVar(2);
+
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("Actions")) {
+            if (ImGui::MenuItem("Refresh Processes", "F5")) {
+                RefreshProcessList(true);
+            }
+            if (ImGui::MenuItem("Inject Selected DLL", "Ctrl+I")) {
+                InjectDllFromBuffer(injectDllPath_, "Injector");
+            }
+            if (ImGui::MenuItem(captureRunning_ ? "Stop Capture" : "Start Capture", "Ctrl+R")) {
+                if (captureRunning_) {
+                    StopCapture();
+                } else {
+                    StartCapture();
+                }
+            }
+            ImGui::EndMenu();
+        }
+        ImGui::TextUnformatted(captureRunning_ ? "Capture: RUNNING" : "Capture: IDLE");
+        ImGui::Separator();
+        ImGui::Text("PID: %lu", static_cast<unsigned long>(SelectedPid()));
+        ImGui::EndMenuBar();
+    }
+
+    const ImGuiID dockspaceId = ImGui::GetID("MainDockspace");
+    ImGuiDockNodeFlags dockFlags = ImGuiDockNodeFlags_None;
+    ImGui::DockSpace(dockspaceId, ImVec2(0.0f, 0.0f), dockFlags);
+    if (!dockLayoutBuilt_) {
+        BuildDefaultDockLayout(dockspaceId);
+        dockLayoutBuilt_ = true;
+    }
+    ImGui::End();
+
+    RenderProcessPanel();
+    RenderWorkspacePanel();
+    RenderLogPanel();
+}
+
+void RipperForgeApp::HandleHotkeys() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput) {
+        return;
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
+        RefreshProcessList(true);
+    }
+
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_I)) {
+        InjectDllFromBuffer(injectDllPath_, "Injector");
+    }
+
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R)) {
+        if (captureRunning_) {
+            StopCapture();
+        } else {
+            StartCapture();
+        }
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F6)) {
+        if (typedScanRunning_) {
+            CancelTypedScan();
+        } else if (typedScanHasSession_) {
+            StartTypedScanNext();
+        } else {
+            StartTypedScanFirst();
+        }
+    }
+}
+
+void RipperForgeApp::RenderProcessPanel() {
+    if (!ImGui::Begin("Process Control")) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::TextUnformatted("Process Browser");
+    ImGui::Separator();
+
+    ImGui::InputTextWithHint("##procfilter", "Filter by name/path", processFilter_.data(), processFilter_.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh")) {
+        RefreshProcessList(true);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Elevate")) {
+        if (!core::IsRunningAsAdmin()) {
+            if (core::RelaunchAsAdmin()) {
+                core::Logger::Instance().Info("Relaunching as administrator.");
+            } else {
+                core::Logger::Instance().Error("Elevation prompt failed.");
+            }
+        } else {
+            core::Logger::Instance().Info("Already running as administrator.");
+        }
+    }
+
+    ImGui::Checkbox("Auto Refresh", &autoRefreshProcesses_);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160.0f);
+    int interval = static_cast<int>(processRefreshIntervalMs_);
+    if (ImGui::SliderInt("Refresh ms", &interval, 500, 10000)) {
+        processRefreshIntervalMs_ = static_cast<uint32_t>(interval);
+    }
+
+    if (ImGui::BeginTable("process_table", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersOuter, ImVec2(0, 0))) {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.33f);
+        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch, 0.67f);
+        ImGui::TableHeadersRow();
+
+        for (size_t i = 0; i < processes_.size(); ++i) {
+            const auto& process = processes_[i];
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            const bool isSelected = selectedPid_ == process.pid;
+            ImGui::PushID(static_cast<int>(process.pid));
+            if (ImGui::Selectable(WideToUtf8(process.name).c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
+                selectedProcessIndex_ = static_cast<int>(i);
+                selectedPid_ = process.pid;
+            }
+            ImGui::PopID();
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%lu", static_cast<unsigned long>(process.pid));
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(WideToUtf8(process.imagePath).c_str());
+        }
+
+        ImGui::EndTable();
+    }
+
+    ImGui::End();
+}
+
+void RipperForgeApp::RenderWorkspacePanel() {
+    if (!ImGui::Begin("Workspace")) {
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::BeginTabBar("workspace_tabs")) {
+        if (ImGui::BeginTabItem("Injector")) {
+            RenderInjectorTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Asset Ripper")) {
+            RenderAssetRipperTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Hooks")) {
+            RenderHookManagerTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Reverse Toolkit")) {
+            RenderReverseToolkitTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Plugins")) {
+            RenderPluginsTab();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    ImGui::End();
+}
+
+void RipperForgeApp::RenderInjectorTab() {
+    ImGui::TextUnformatted("DLL Injection");
+    ImGui::Separator();
+
+    ImGui::InputText("DLL Path", injectDllPath_.data(), injectDllPath_.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Browse DLL")) {
+        std::wstring path;
+        if (BrowseOpenFile(hwnd_, L"DLL Files (*.dll)\0*.dll\0All Files (*.*)\0*.*\0", path)) {
+            SetBuffer(injectDllPath_, path);
+        }
+    }
+
+    if (ImGui::Button("Inject Selected Process")) {
+        InjectDllFromBuffer(injectDllPath_, "Injector");
+    }
+}
+
+void RipperForgeApp::RenderAssetRipperTab() {
+    ImGui::TextUnformatted("AssetRIpper Capture + Export");
+    ImGui::Separator();
+
+    ImGui::InputText("Capture DLL", captureDllPath_.data(), captureDllPath_.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Browse Capture DLL")) {
+        std::wstring path;
+        if (BrowseOpenFile(hwnd_, L"DLL Files (*.dll)\0*.dll\0All Files (*.*)\0*.*\0", path)) {
+            SetBuffer(captureDllPath_, path);
+            assetBridge_.SetCaptureDllPath(path);
+        }
+    }
+
+    ImGui::InputText("Output Directory", captureOutputDir_.data(), captureOutputDir_.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Browse Output")) {
+        std::wstring path;
+        if (BrowseDirectory(hwnd_, path)) {
+            SetBuffer(captureOutputDir_, path);
+            assetBridge_.SetOutputDirectory(path);
+        }
+    }
+
+    if (!captureRunning_) {
+        if (ImGui::Button("Start Capture")) {
+            StartCapture();
+        }
+    } else {
+        if (ImGui::Button("Stop Capture")) {
+            StopCapture();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(captureScanRunning_ ? "Scanning..." : "Scan Assets")) {
+        RequestCaptureScan(true);
+    }
+
+    float progress = assetBridge_.QueryCaptureProgress();
+    if (progress < 0.0f) {
+        const size_t total = capturedTextures_.size() + capturedModels_.size();
+        progress = std::min(0.95f, static_cast<float>(total) / 100.0f);
+    }
+    ImGui::ProgressBar(std::clamp(progress, 0.0f, 1.0f), ImVec2(-1, 0), captureRunning_ ? "Capture Running" : "Idle");
+
+    if (ImGui::BeginTable("asset_layout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Lists", ImGuiTableColumnFlags_WidthStretch, 0.48f);
+        ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_WidthStretch, 0.52f);
+        ImGui::TableNextRow();
+
+        ImGui::TableSetColumnIndex(0);
+        if (ImGui::BeginChild("asset_lists")) {
+            ImGui::Text("Textures (%d)", static_cast<int>(capturedTextures_.size()));
+            if (ImGui::BeginListBox("##texture_list", ImVec2(-1, 170))) {
+                for (int i = 0; i < static_cast<int>(capturedTextures_.size()); ++i) {
+                    const bool selected = (selectedTextureIndex_ == i);
+                    const std::string name = WideToUtf8(capturedTextures_[static_cast<size_t>(i)].filename().wstring());
+                    ImGui::PushID(i);
+                    if (ImGui::Selectable(name.c_str(), selected)) {
+                        selectedTextureIndex_ = i;
+                    }
+                    if (selected && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        LoadTextureAsset(capturedTextures_[static_cast<size_t>(i)]);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndListBox();
+            }
+            if (ImGui::Button("Load Texture") && selectedTextureIndex_ >= 0 &&
+                selectedTextureIndex_ < static_cast<int>(capturedTextures_.size())) {
+                LoadTextureAsset(capturedTextures_[static_cast<size_t>(selectedTextureIndex_)]);
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Models (%d)", static_cast<int>(capturedModels_.size()));
+            if (ImGui::BeginListBox("##model_list", ImVec2(-1, 170))) {
+                for (int i = 0; i < static_cast<int>(capturedModels_.size()); ++i) {
+                    const bool selected = (selectedModelIndex_ == i);
+                    const std::string name = WideToUtf8(capturedModels_[static_cast<size_t>(i)].filename().wstring());
+                    ImGui::PushID(i);
+                    if (ImGui::Selectable(name.c_str(), selected)) {
+                        selectedModelIndex_ = i;
+                    }
+                    if (selected && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        LoadModelAsset(capturedModels_[static_cast<size_t>(i)]);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndListBox();
+            }
+            if (ImGui::Button("Load Model") && selectedModelIndex_ >= 0 &&
+                selectedModelIndex_ < static_cast<int>(capturedModels_.size())) {
+                LoadModelAsset(capturedModels_[static_cast<size_t>(selectedModelIndex_)]);
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::TableSetColumnIndex(1);
+        if (ImGui::BeginChild("preview_area", ImVec2(0, 0), true)) {
+            ImGui::TextUnformatted("DirectX 11 Preview");
+            ImGui::Separator();
+            const ImVec2 available = ImGui::GetContentRegionAvail();
+            const ImVec2 slotSize(
+                std::max(150.0f, available.x),
+                std::max(200.0f, available.y - 52.0f));
+            ImGui::InvisibleButton("##preview_slot", slotSize);
+            const ImVec2 minScreen = ImGui::GetItemRectMin();
+            const ImVec2 maxScreen = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRect(minScreen, maxScreen, IM_COL32(120, 145, 180, 180), 2.0f, 0, 1.5f);
+            PlacePreviewHost(minScreen, maxScreen);
+
+            if (ImGui::Button("Export PNG")) {
+                ExportCurrentTexturePng();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Export OBJ")) {
+                ExportCurrentMeshObj();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Export FBX")) {
+                ExportCurrentMeshFbx();
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::EndTable();
+    }
+}
+
+void RipperForgeApp::RenderHookManagerTab() {
+    ImGui::TextUnformatted("Hook Manager");
+    ImGui::Separator();
+
+    ImGui::Combo("Engine Template", &selectedHookEngine_, "Unity\0Source\0Unreal\0");
+    ImGui::Combo("Backend", &selectedHookBackend_, "MinHook\0Detours\0");
+
+    ImGui::InputText("Hook DLL", hookDllPath_.data(), hookDllPath_.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Browse Hook DLL")) {
+        std::wstring path;
+        if (BrowseOpenFile(hwnd_, L"DLL Files (*.dll)\0*.dll\0All Files (*.*)\0*.*\0", path)) {
+            SetBuffer(hookDllPath_, path);
+        }
+    }
+
+    if (ImGui::Button("Generate Hook Template")) {
+        GenerateHookTemplate();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Inject Hook DLL")) {
+        InjectDllFromBuffer(hookDllPath_, "Hook");
+    }
+
+    if (selectedHookBackend_ == 0) {
+        ImGui::TextUnformatted("MinHook selected: ensure MinHook headers/libs are available in your hook project.");
+    } else {
+        ImGui::TextUnformatted("Detours selected: ensure detours.h + detours.lib are configured.");
+    }
+}
+
+void RipperForgeApp::RenderReverseToolkitTab() {
+    ImGui::TextUnformatted("Reverse Toolkit");
+    ImGui::Separator();
+
+    if (ImGui::BeginTable("reverse_scan_controls", 2, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted("Value Type");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::Combo("##valuetype", &typedScanTypeIndex_, "int32\0int64\0float\0double\0utf8_string\0byte_array\0");
+
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted("Next Filter");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::Combo("##nextfilter", &typedScanCompareIndex_, "exact\0changed\0unchanged\0increased\0decreased\0equals\0");
+
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted("Scan Value");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##scanvalue", typedScanValue_.data(), typedScanValue_.size());
+
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted("Range Start");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##rangestart", scanRangeStart_.data(), scanRangeStart_.size());
+
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted("Range End");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##rangeend", scanRangeEnd_.data(), scanRangeEnd_.size());
+
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted("Actions");
+        if (ImGui::Button(typedScanRunning_ ? "Scanning..." : "First Scan")) {
+            StartTypedScanFirst();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Next Scan")) {
+            StartTypedScanNext();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel Scan")) {
+            CancelTypedScan();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add Result To Watch")) {
+            AddSelectedScanResultToWatch();
+        }
+
+        ImGui::EndTable();
+    }
+
+    if (!typedScanStatusLine_.empty()) {
+        ImGui::TextUnformatted(typedScanStatusLine_.c_str());
+    }
+
+    if (ImGui::BeginTable("typed_scan_table", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, ImVec2(0, 220))) {
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < typedScanRows_.size(); ++i) {
+            const auto& row = typedScanRows_[i];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%u", static_cast<unsigned>(i));
+            ImGui::TableSetColumnIndex(1);
+            const bool selected = selectedTypedResultIndex_ == static_cast<int>(i);
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::Selectable(FormatAddress(row.address).c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                selectedTypedResultIndex_ = static_cast<int>(i);
+            }
+            ImGui::PopID();
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(row.value.c_str());
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Pointer Chain Explorer");
+    if (ImGui::BeginTable("pointer_controls", 2, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted("Base Address");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##baseaddress", pointerBaseAddress_.data(), pointerBaseAddress_.size());
+
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted("Offsets (hex,csv)");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##offsets", pointerOffsets_.data(), pointerOffsets_.size());
+
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        if (ImGui::Button("Resolve Chain")) {
+            ResolvePointerChainFromUi();
+        }
+
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted("Resolved Target");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##resolvedtarget", pointerResolvedAddress_.data(), pointerResolvedAddress_.size(), ImGuiInputTextFlags_ReadOnly);
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Watch / Freeze");
+    int freezeInterval = static_cast<int>(freezeIntervalMs_);
+    if (ImGui::SliderInt("Freeze Interval (ms)", &freezeInterval, 30, 1000)) {
+        freezeIntervalMs_ = static_cast<uint32_t>(freezeInterval);
+    }
+
+    std::vector<size_t> removeIndices;
+    if (ImGui::BeginTable("watch_table", 8, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, ImVec2(0, 220))) {
+        ImGui::TableSetupColumn("Freeze", ImGuiTableColumnFlags_WidthFixed, 54.0f);
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Current", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Freeze Value", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Del", ImGuiTableColumnFlags_WidthFixed, 34.0f);
+        ImGui::TableHeadersRow();
+
+        for (size_t i = 0; i < watchList_.size(); ++i) {
+            auto& entry = watchList_[i];
+            ImGui::PushID(static_cast<int>(entry.id));
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Checkbox("##freeze", &entry.freeze);
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::InputText("##label", entry.label.data(), entry.label.size());
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(FormatAddress(entry.address).c_str());
+
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(kScanTypeLabels[static_cast<size_t>(entry.type)]);
+
+            ImGui::TableSetColumnIndex(4);
+            ImGui::TextUnformatted(entry.currentValue.c_str());
+
+            ImGui::TableSetColumnIndex(5);
+            ImGui::InputText("##freeze_value", entry.freezeValue.data(), entry.freezeValue.size());
+
+            ImGui::TableSetColumnIndex(6);
+            ImGui::TextUnformatted(entry.status.c_str());
+
+            ImGui::TableSetColumnIndex(7);
+            if (ImGui::Button("X")) {
+                removeIndices.push_back(i);
+            }
+
+            ImGui::PopID();
+        }
+
+        ImGui::EndTable();
+    }
+
+    for (auto it = removeIndices.rbegin(); it != removeIndices.rend(); ++it) {
+        watchList_.erase(watchList_.begin() + static_cast<ptrdiff_t>(*it));
+    }
+
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("AoB Pattern Scan (Legacy API)")) {
+        ImGui::InputText("Pattern", patternScanInput_.data(), patternScanInput_.size());
+        if (ImGui::Button(patternScanRunning_ ? "Pattern Scanning..." : "Start Pattern Scan")) {
+            StartPatternScan();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel Pattern Scan")) {
+            CancelPatternScan();
+        }
+        if (ImGui::BeginListBox("##pattern_results", ImVec2(-1, 130))) {
+            for (size_t i = 0; i < patternScanResults_.size(); ++i) {
+                const auto address = patternScanResults_[i];
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::Selectable(FormatAddress(address).c_str(), false);
+                ImGui::PopID();
+            }
+            ImGui::EndListBox();
+        }
+    }
+}
+
+void RipperForgeApp::RenderPluginsTab() {
+    if (ImGui::Button("Reload Plugins")) {
+        pluginManager_.Reload(pluginDir_);
+        core::Logger::Instance().Info("Plugin catalog refreshed.");
+    }
+
+    ImGui::Separator();
+    const auto& plugins = pluginManager_.Plugins();
+    for (const auto& plugin : plugins) {
+        ImGui::BulletText("%s (%s)", plugin.name.c_str(), WideToUtf8(plugin.filePath).c_str());
+    }
+    if (plugins.empty()) {
+        ImGui::TextUnformatted("No plugins loaded.");
+    }
+}
+
+void RipperForgeApp::RenderLogPanel() {
+    if (!ImGui::Begin("Log Console")) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Checkbox("Auto Scroll", &showLogAutoScroll_);
+    ImGui::Separator();
+
+    const auto lines = core::Logger::Instance().Snapshot();
+    ImGui::BeginChild("logs_scroll");
+    for (const auto& line : lines) {
+        ImGui::TextUnformatted(line.c_str());
+    }
+    if (showLogAutoScroll_ && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 8.0f) {
+        ImGui::SetScrollHereY(1.0f);
+    }
+    ImGui::EndChild();
+
+    ImGui::End();
+}
+
+void RipperForgeApp::RefreshProcessList(bool logRefresh) {
+    const std::wstring filter = Utf8ToWide(BufferString(processFilter_));
+    const DWORD previousPid = selectedPid_;
+    processes_ = core::EnumerateProcesses(filter);
+
+    selectedPid_ = 0;
+    selectedProcessIndex_ = -1;
+    for (size_t i = 0; i < processes_.size(); ++i) {
+        if (processes_[i].pid == previousPid) {
+            selectedPid_ = previousPid;
+            selectedProcessIndex_ = static_cast<int>(i);
+            break;
+        }
+    }
+
+    if (logRefresh) {
+        core::Logger::Instance().Info("Process list refreshed: " + std::to_string(processes_.size()) + " entries.");
+    }
+}
+
+DWORD RipperForgeApp::SelectedPid() const {
+    return selectedPid_;
+}
+
+bool RipperForgeApp::InjectDllFromBuffer(const std::array<char, 1024>& pathBuffer, const char* contextLabel) {
+    const DWORD pid = SelectedPid();
+    if (pid == 0) {
+        core::Logger::Instance().Error("Select a target process first.");
+        return false;
+    }
+
+    const std::wstring dllPath = Utf8ToWide(BufferString(pathBuffer));
+    if (dllPath.empty()) {
+        core::Logger::Instance().Error("DLL path is empty.");
+        return false;
+    }
+
+    std::string error;
+    if (!core::InjectDll(pid, dllPath, error)) {
+        core::Logger::Instance().Error(std::string(contextLabel) + " injection failed: " + error);
+        return false;
+    }
+
+    core::Logger::Instance().Info(std::string(contextLabel) + " injection succeeded for PID " + std::to_string(pid) + ".");
+    return true;
+}
+
+void RipperForgeApp::StartCapture() {
+    const DWORD pid = SelectedPid();
+    if (pid == 0) {
+        core::Logger::Instance().Error("Select a process before capture.");
+        return;
+    }
+
+    const std::wstring captureDll = Utf8ToWide(BufferString(captureDllPath_));
+    const std::wstring outputDir = Utf8ToWide(BufferString(captureOutputDir_));
+    if (captureDll.empty() || outputDir.empty()) {
+        core::Logger::Instance().Error("Capture DLL and output directory are required.");
+        return;
+    }
+
+    assetBridge_.SetCaptureDllPath(captureDll);
+    assetBridge_.SetOutputDirectory(outputDir);
+
+    std::string error;
+    if (!assetBridge_.StartCapture(pid, error)) {
+        core::Logger::Instance().Error("Capture start failed: " + error);
+        return;
+    }
+
+    captureRunning_ = true;
+    nextAutoCaptureScan_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(kAutoCaptureScanIntervalMs);
+    core::Logger::Instance().Info("Asset capture started for PID " + std::to_string(pid) + ".");
+    RequestCaptureScan(false);
+}
+
+void RipperForgeApp::StopCapture() {
+    assetBridge_.StopCapture();
+    captureRunning_ = false;
+    core::Logger::Instance().Info("Capture stopped.");
+    RequestCaptureScan(false);
+}
+
+void RipperForgeApp::RequestCaptureScan(bool logResult) {
+    if (captureScanRunning_) {
+        queuedCaptureScan_ = true;
+        queuedCaptureScanLog_ = queuedCaptureScanLog_ || logResult;
+        return;
+    }
+
+    const std::wstring outputDir = Utf8ToWide(BufferString(captureOutputDir_));
+    if (outputDir.empty()) {
+        core::Logger::Instance().Error("Capture output directory is empty.");
+        return;
+    }
+
+    captureScanRunning_ = true;
+    queuedCaptureScan_ = false;
+    queuedCaptureScanLog_ = false;
+    const uint64_t jobId = ++captureScanJobCounter_;
+    activeCaptureScanJob_ = jobId;
+
+    captureScanFuture_ = std::async(std::launch::async, [jobId, outputDir, logResult]() {
+        CaptureScanJobResult result;
+        result.jobId = jobId;
+        result.logResult = logResult;
+
+        const auto begin = std::chrono::steady_clock::now();
+        try {
+            constexpr std::array<const wchar_t*, 8> kTextureExtensions = {
+                L".dds", L".png", L".jpg", L".jpeg", L".bmp", L".tif", L".tiff", L".gif",
+            };
+            constexpr std::array<const wchar_t*, 8> kModelExtensions = {
+                L".obj", L".fbx", L".glb", L".gltf", L".ply", L".stl", L".dae", L".x",
+            };
+
+            result.textures = EnumerateFilesWithExtensions(outputDir, kTextureExtensions);
+            result.models = EnumerateFilesWithExtensions(outputDir, kModelExtensions);
+        } catch (const std::exception& ex) {
+            result.error = ex.what();
+        }
+
+        result.elapsedMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin).count());
+        return result;
+    });
+}
+
+void RipperForgeApp::PollCaptureScanJob() {
+    if (!captureScanRunning_ || !captureScanFuture_.valid()) {
+        return;
+    }
+
+    if (captureScanFuture_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        return;
+    }
+
+    CaptureScanJobResult result = captureScanFuture_.get();
+    captureScanRunning_ = false;
+    if (result.jobId != activeCaptureScanJob_) {
+        return;
+    }
+
+    if (!result.error.empty()) {
+        core::Logger::Instance().Error("Capture scan failed: " + result.error);
+    } else {
+        capturedTextures_ = std::move(result.textures);
+        capturedModels_ = std::move(result.models);
+        if (result.logResult) {
+            core::Logger::Instance().Info(
+                "Capture scan finished: " + std::to_string(capturedTextures_.size()) + " textures, " +
+                std::to_string(capturedModels_.size()) + " models in " +
+                std::to_string(result.elapsedMs) + " ms.");
+        }
+    }
+
+    if (queuedCaptureScan_) {
+        const bool logAgain = queuedCaptureScanLog_;
+        queuedCaptureScan_ = false;
+        queuedCaptureScanLog_ = false;
+        RequestCaptureScan(logAgain);
+    }
+}
+
+void RipperForgeApp::LoadTextureAsset(const std::filesystem::path& path) {
+    std::string error;
+    core::TextureData texture;
+    if (!core::LoadTextureFromFile(path.wstring(), texture, error)) {
+        core::Logger::Instance().Error("Texture load failed: " + error);
+        return;
+    }
+
+    if (previewReady_) {
+        if (!previewRenderer_.SetTexture(texture, error)) {
+            core::Logger::Instance().Error("Preview texture upload failed: " + error);
+            return;
+        }
+        previewRenderer_.SetMode(core::PreviewMode::Texture);
+    }
+
+    currentTexture_ = std::move(texture);
+    settings_.lastTextureAssetPath = path.wstring();
+    core::Logger::Instance().Info("Texture loaded: " + WideToUtf8(path.wstring()));
+}
+
+void RipperForgeApp::LoadModelAsset(const std::filesystem::path& path) {
+    std::string error;
+    core::MeshData mesh;
+    if (!core::LoadMeshFromObj(path.wstring(), mesh, error)) {
+        core::Logger::Instance().Error("Model load failed: " + error + " (preview currently expects OBJ).");
+        return;
+    }
+
+    if (previewReady_) {
+        if (!previewRenderer_.SetMesh(mesh, error)) {
+            core::Logger::Instance().Error("Preview mesh upload failed: " + error);
+            return;
+        }
+        previewRenderer_.SetMode(core::PreviewMode::Model);
+    }
+
+    currentMesh_ = std::move(mesh);
+    settings_.lastModelAssetPath = path.wstring();
+    core::Logger::Instance().Info("Model loaded: " + WideToUtf8(path.wstring()));
+}
+
+void RipperForgeApp::ExportCurrentTexturePng() {
+    if (currentTexture_.rgba8.empty()) {
+        core::Logger::Instance().Error("No texture loaded.");
+        return;
+    }
+
+    std::wstring defaultName = L"capture_texture.png";
+    if (!currentTexture_.sourcePath.empty()) {
+        defaultName = std::filesystem::path(currentTexture_.sourcePath).stem().wstring() + L".png";
+    }
+
+    std::wstring outputPath;
+    if (!BrowseSaveFile(
+            hwnd_,
+            L"PNG Image (*.png)\0*.png\0All Files (*.*)\0*.*\0",
+            L"png",
+            defaultName,
+            outputPath)) {
+        return;
+    }
+
+    std::string error;
+    if (!core::SaveTextureToPng(outputPath, currentTexture_, error)) {
+        core::Logger::Instance().Error("PNG export failed: " + error);
+        return;
+    }
+
+    core::Logger::Instance().Info("PNG exported: " + WideToUtf8(outputPath));
+}
+
+void RipperForgeApp::ExportCurrentMeshObj() {
+    if (currentMesh_.vertices.empty() || currentMesh_.indices.empty()) {
+        core::Logger::Instance().Error("No mesh loaded.");
+        return;
+    }
+
+    std::wstring defaultName = L"capture_mesh.obj";
+    if (!currentMesh_.sourcePath.empty()) {
+        defaultName = std::filesystem::path(currentMesh_.sourcePath).stem().wstring() + L".obj";
+    }
+
+    std::wstring outputPath;
+    if (!BrowseSaveFile(
+            hwnd_,
+            L"Wavefront OBJ (*.obj)\0*.obj\0All Files (*.*)\0*.*\0",
+            L"obj",
+            defaultName,
+            outputPath)) {
+        return;
+    }
+
+    std::string error;
+    if (!core::SaveMeshToObj(outputPath, currentMesh_, error)) {
+        core::Logger::Instance().Error("OBJ export failed: " + error);
+        return;
+    }
+
+    core::Logger::Instance().Info("OBJ exported: " + WideToUtf8(outputPath));
+}
+
+void RipperForgeApp::ExportCurrentMeshFbx() {
+    if (currentMesh_.vertices.empty() || currentMesh_.indices.empty()) {
+        core::Logger::Instance().Error("No mesh loaded.");
+        return;
+    }
+
+    std::wstring defaultName = L"capture_mesh.fbx";
+    if (!currentMesh_.sourcePath.empty()) {
+        defaultName = std::filesystem::path(currentMesh_.sourcePath).stem().wstring() + L".fbx";
+    }
+
+    std::wstring outputPath;
+    if (!BrowseSaveFile(
+            hwnd_,
+            L"Autodesk FBX (*.fbx)\0*.fbx\0All Files (*.*)\0*.*\0",
+            L"fbx",
+            defaultName,
+            outputPath)) {
+        return;
+    }
+
+    std::string error;
+    if (!core::SaveMeshToFbxAscii(outputPath, currentMesh_, error)) {
+        core::Logger::Instance().Error("FBX export failed: " + error);
+        return;
+    }
+
+    core::Logger::Instance().Info("FBX exported: " + WideToUtf8(outputPath));
+}
+
+void RipperForgeApp::GenerateHookTemplate() {
+    const std::wstring engine = kHookEngines[static_cast<size_t>(std::clamp(selectedHookEngine_, 0, 2))];
+    const std::wstring backend = kHookBackends[static_cast<size_t>(std::clamp(selectedHookBackend_, 0, 1))];
+
+    std::filesystem::path outputDir =
+        std::filesystem::path(moduleDir_) / L"hooks" / (engine + L"_" + backend);
+    std::error_code ec;
+    std::filesystem::create_directories(outputDir, ec);
+    if (ec) {
+        core::Logger::Instance().Error("Could not create hook output directory.");
+        return;
+    }
+
+    std::filesystem::path outputPath = outputDir / (engine + L"HookTemplate.cpp");
+    std::ofstream stream(outputPath, std::ios::binary | std::ios::trunc);
+    if (!stream.good()) {
+        core::Logger::Instance().Error("Failed to write hook template file.");
+        return;
+    }
+
+    stream << "// Generated by RipperForge\n";
+    stream << "#include <Windows.h>\n";
+    if (_wcsicmp(backend.c_str(), L"Detours") == 0) {
+        stream << "#include <detours.h>\n\n";
+        stream << "static decltype(&Sleep) g_originalSleep = &Sleep;\n";
+        stream << "VOID WINAPI HookedSleep(DWORD ms) { g_originalSleep(ms); }\n\n";
+        stream << "bool InstallHooks() {\n";
+        stream << "    if (DetourTransactionBegin() != NO_ERROR) return false;\n";
+        stream << "    if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR) return false;\n";
+        stream << "    if (DetourAttach(&(PVOID&)g_originalSleep, HookedSleep) != NO_ERROR) return false;\n";
+        stream << "    return DetourTransactionCommit() == NO_ERROR;\n";
+        stream << "}\n";
+        stream << "void RemoveHooks() {\n";
+        stream << "    DetourTransactionBegin();\n";
+        stream << "    DetourUpdateThread(GetCurrentThread());\n";
+        stream << "    DetourDetach(&(PVOID&)g_originalSleep, HookedSleep);\n";
+        stream << "    DetourTransactionCommit();\n";
+        stream << "}\n";
+    } else {
+        stream << "#include <MinHook.h>\n\n";
+        stream << "static decltype(&Sleep) g_originalSleep = &Sleep;\n";
+        stream << "VOID WINAPI HookedSleep(DWORD ms) { g_originalSleep(ms); }\n\n";
+        stream << "bool InstallHooks() {\n";
+        stream << "    if (MH_Initialize() != MH_OK) return false;\n";
+        stream << "    if (MH_CreateHook(&Sleep, &HookedSleep, reinterpret_cast<LPVOID*>(&g_originalSleep)) != MH_OK) return false;\n";
+        stream << "    return MH_EnableHook(MH_ALL_HOOKS) == MH_OK;\n";
+        stream << "}\n";
+        stream << "void RemoveHooks() {\n";
+        stream << "    MH_DisableHook(MH_ALL_HOOKS);\n";
+        stream << "    MH_Uninitialize();\n";
+        stream << "}\n";
+    }
+    stream << "BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {\n";
+    stream << "    if (reason == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(module); InstallHooks(); }\n";
+    stream << "    else if (reason == DLL_PROCESS_DETACH) { RemoveHooks(); }\n";
+    stream << "    return TRUE;\n";
+    stream << "}\n";
+
+    std::filesystem::path notesPath = outputDir / L"build_notes.txt";
+    std::ofstream notes(notesPath, std::ios::binary | std::ios::trunc);
+    if (notes.good()) {
+        notes << "Backend: " << WideToUtf8(backend) << "\n";
+        notes << "1) Configure include/lib paths for the backend.\n";
+        notes << "2) Build x64 DLL.\n";
+        notes << "3) Set built DLL path in Hook tab and inject.\n";
+    }
+
+    SetBuffer(hookDllPath_, (outputDir / (engine + L"Hook.dll")).wstring());
+    settings_.hookBackend = backend;
+    core::Logger::Instance().Info("Hook template generated: " + WideToUtf8(outputPath.wstring()));
+}
+
+void RipperForgeApp::StartTypedScanFirst() {
+    if (typedScanRunning_) {
+        core::Logger::Instance().Info("Typed scan already running.");
+        return;
+    }
+
+    const DWORD pid = SelectedPid();
+    if (pid == 0) {
+        core::Logger::Instance().Error("Select a process before scanning.");
+        return;
+    }
+
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    if (!ParseAddress(BufferString(scanRangeStart_), start) || !ParseAddress(BufferString(scanRangeEnd_), end) || end <= start) {
+        core::Logger::Instance().Error("Invalid scan range.");
+        return;
+    }
+
+    const core::TypedScanValueType type = TypeFromIndex(typedScanTypeIndex_);
+    std::vector<uint8_t> queryValue;
+    std::string parseError;
+    if (!core::ParseTypedValueInput(type, BufferString(typedScanValue_), queryValue, parseError)) {
+        core::Logger::Instance().Error("Scan value parse failed: " + parseError);
+        return;
+    }
+
+    typedScanRows_.clear();
+    selectedTypedResultIndex_ = -1;
+    typedScanCancelToken_ = std::make_shared<std::atomic_bool>(false);
+    typedScanRunning_ = true;
+    typedScanStatusLine_ = "First scan in progress...";
+    const uint64_t jobId = ++typedScanJobCounter_;
+    activeTypedScanJob_ = jobId;
+
+    typedScanFuture_ = std::async(std::launch::async, [jobId, pid, start, end, type, queryValue, cancelToken = typedScanCancelToken_]() {
+        TypedScanJobResult result;
+        result.jobId = jobId;
+        const auto begin = std::chrono::steady_clock::now();
+        core::FirstTypedScan(
+            pid,
+            start,
+            end,
+            type,
+            queryValue,
+            2500,
+            result.session,
+            result.error,
+            cancelToken.get());
+        result.elapsedMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin).count());
+        return result;
+    });
+}
+
+void RipperForgeApp::StartTypedScanNext() {
+    if (typedScanRunning_) {
+        core::Logger::Instance().Info("Typed scan already running.");
+        return;
+    }
+    if (!typedScanHasSession_ || typedScanSession_.addresses.empty()) {
+        core::Logger::Instance().Error("No active typed scan session. Run First Scan first.");
+        return;
+    }
+
+    std::vector<uint8_t> equalsValue;
+    const auto compareMode = CompareModeFromIndex(typedScanCompareIndex_);
+    if (compareMode == core::TypedScanCompareMode::Equals) {
+        std::string parseError;
+        if (!core::ParseTypedValueInput(
+                TypeFromIndex(typedScanTypeIndex_),
+                BufferString(typedScanValue_),
+                equalsValue,
+                parseError)) {
+            core::Logger::Instance().Error("Equals value parse failed: " + parseError);
+            return;
+        }
+    }
+
+    typedScanCancelToken_ = std::make_shared<std::atomic_bool>(false);
+    typedScanRunning_ = true;
+    typedScanStatusLine_ = "Next scan in progress...";
+    const uint64_t jobId = ++typedScanJobCounter_;
+    activeTypedScanJob_ = jobId;
+    const core::TypedScanSession previousSession = typedScanSession_;
+
+    typedScanFuture_ = std::async(std::launch::async, [jobId, previousSession, compareMode, equalsValue, cancelToken = typedScanCancelToken_]() {
+        TypedScanJobResult result;
+        result.jobId = jobId;
+        const auto begin = std::chrono::steady_clock::now();
+        core::NextTypedScan(
+            previousSession,
+            compareMode,
+            equalsValue,
+            2500,
+            result.session,
+            result.error,
+            cancelToken.get());
+        result.elapsedMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin).count());
+        return result;
+    });
+}
+
+void RipperForgeApp::CancelTypedScan() {
+    if (typedScanCancelToken_) {
+        typedScanCancelToken_->store(true);
+    }
+}
+
+void RipperForgeApp::PollTypedScanJob() {
+    if (!typedScanRunning_ || !typedScanFuture_.valid()) {
+        return;
+    }
+    if (typedScanFuture_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        return;
+    }
+
+    TypedScanJobResult result = typedScanFuture_.get();
+    typedScanRunning_ = false;
+    if (result.jobId != activeTypedScanJob_) {
+        return;
+    }
+
+    if (!result.error.empty()) {
+        typedScanStatusLine_ = "Typed scan failed: " + result.error;
+        core::Logger::Instance().Error(typedScanStatusLine_);
+        return;
+    }
+
+    typedScanSession_ = std::move(result.session);
+    typedScanHasSession_ = true;
+    typedScanRows_.clear();
+    for (size_t i = 0; i < typedScanSession_.addresses.size(); ++i) {
+        TypedScanRow row;
+        row.address = typedScanSession_.addresses[i];
+        if (i < typedScanSession_.snapshots.size()) {
+            std::string value;
+            std::string conversionError;
+            if (core::TypedValueBytesToString(typedScanSession_.type, typedScanSession_.snapshots[i], value, conversionError)) {
+                row.value = value;
+            } else {
+                row.value = "<conversion failed>";
+            }
+        }
+        typedScanRows_.push_back(std::move(row));
+    }
+
+    typedScanStatusLine_ =
+        "Typed scan complete: " + std::to_string(typedScanRows_.size()) +
+        " hits in " + std::to_string(result.elapsedMs) + " ms.";
+    core::Logger::Instance().Info(typedScanStatusLine_);
+}
+
+void RipperForgeApp::StartPatternScan() {
+    if (patternScanRunning_) {
+        return;
+    }
+
+    const DWORD pid = SelectedPid();
+    if (pid == 0) {
+        core::Logger::Instance().Error("Select a process before AoB scan.");
+        return;
+    }
+
+    std::vector<int> pattern;
+    std::string error;
+    if (!core::ParsePattern(BufferString(patternScanInput_), pattern, error)) {
+        core::Logger::Instance().Error("Pattern parse failed: " + error);
+        return;
+    }
+
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(systemInfo.lpMinimumApplicationAddress);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(systemInfo.lpMaximumApplicationAddress);
+
+    patternScanCancelToken_ = std::make_shared<std::atomic_bool>(false);
+    patternScanRunning_ = true;
+    const uint64_t jobId = ++patternScanJobCounter_;
+    activePatternScanJob_ = jobId;
+
+    patternScanFuture_ = std::async(std::launch::async, [jobId, pid, start, end, pattern, cancelToken = patternScanCancelToken_]() {
+        PatternScanJobResult result;
+        result.jobId = jobId;
+        const auto begin = std::chrono::steady_clock::now();
+        result.addresses = core::ScanPattern(pid, start, end, pattern, 512, result.error, cancelToken.get());
+        result.elapsedMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin).count());
+        return result;
+    });
+}
+
+void RipperForgeApp::CancelPatternScan() {
+    if (patternScanCancelToken_) {
+        patternScanCancelToken_->store(true);
+    }
+}
+
+void RipperForgeApp::PollPatternScanJob() {
+    if (!patternScanRunning_ || !patternScanFuture_.valid()) {
+        return;
+    }
+    if (patternScanFuture_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        return;
+    }
+
+    PatternScanJobResult result = patternScanFuture_.get();
+    patternScanRunning_ = false;
+    if (result.jobId != activePatternScanJob_) {
+        return;
+    }
+
+    if (!result.error.empty()) {
+        core::Logger::Instance().Error("Pattern scan failed: " + result.error);
+        return;
+    }
+
+    patternScanResults_ = std::move(result.addresses);
+    core::Logger::Instance().Info(
+        "Pattern scan complete: " + std::to_string(patternScanResults_.size()) +
+        " hits in " + std::to_string(result.elapsedMs) + " ms.");
+}
+
+void RipperForgeApp::ResolvePointerChainFromUi() {
+    const DWORD pid = SelectedPid();
+    if (pid == 0) {
+        core::Logger::Instance().Error("Select a process before pointer-chain resolve.");
+        return;
+    }
+
+    uintptr_t baseAddress = 0;
+    if (!ParseAddress(BufferString(pointerBaseAddress_), baseAddress)) {
+        core::Logger::Instance().Error("Invalid pointer base address.");
+        return;
+    }
+
+    std::vector<uintptr_t> offsets;
+    if (!ParseOffsetsCsv(BufferString(pointerOffsets_), offsets)) {
+        core::Logger::Instance().Error("Invalid offset list. Use hex CSV, e.g. 0x10,0x20.");
+        return;
+    }
+
+    uintptr_t resolved = 0;
+    std::string error;
+    if (!core::ResolvePointerChain(pid, baseAddress, offsets, resolved, error)) {
+        core::Logger::Instance().Error("Pointer chain resolve failed: " + error);
+        return;
+    }
+
+    SetBuffer(pointerResolvedAddress_, FormatAddress(resolved));
+    core::Logger::Instance().Info("Pointer chain resolved: " + FormatAddress(resolved));
+}
+
+void RipperForgeApp::AddSelectedScanResultToWatch() {
+    if (selectedTypedResultIndex_ < 0 || selectedTypedResultIndex_ >= static_cast<int>(typedScanRows_.size())) {
+        core::Logger::Instance().Error("Select a typed scan result first.");
+        return;
+    }
+
+    const auto& row = typedScanRows_[static_cast<size_t>(selectedTypedResultIndex_)];
+    WatchEntry entry;
+    entry.id = watchIdCounter_++;
+    entry.address = row.address;
+    entry.type = TypeFromIndex(typedScanTypeIndex_);
+    entry.byteSize = typedScanSession_.queryValue.empty() ? DefaultTypeByteSize(entry.type) : typedScanSession_.queryValue.size();
+    entry.freeze = false;
+    SetBuffer(entry.label, "watch_" + FormatAddress(row.address));
+    SetBuffer(entry.freezeValue, row.value);
+    entry.currentValue = row.value;
+    watchList_.push_back(entry);
+    core::Logger::Instance().Info("Watch entry created at " + FormatAddress(row.address));
+}
+
+void RipperForgeApp::UpdateWatchList() {
+    const DWORD pid = SelectedPid();
+    if (pid == 0 || watchList_.empty()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto pollInterval = std::chrono::milliseconds(120);
+    const auto freezeInterval = std::chrono::milliseconds(std::max<uint32_t>(30, freezeIntervalMs_));
+
+    for (auto& entry : watchList_) {
+        if (entry.nextPoll.time_since_epoch().count() == 0 || now >= entry.nextPoll) {
+            std::vector<uint8_t> bytes;
+            std::string error;
+            if (core::ReadMemory(pid, entry.address, entry.byteSize, bytes, error)) {
+                std::string value;
+                if (core::TypedValueBytesToString(entry.type, bytes, value, error)) {
+                    entry.currentValue = value;
+                    entry.status = "ok";
+                } else {
+                    entry.status = "decode error";
+                }
+            } else {
+                entry.status = "read failed";
+            }
+            entry.nextPoll = now + pollInterval;
+        }
+
+        if (entry.freeze && (entry.nextFreeze.time_since_epoch().count() == 0 || now >= entry.nextFreeze)) {
+            std::vector<uint8_t> freezeBytes;
+            std::string error;
+            if (core::ParseTypedValueInput(entry.type, BufferString(entry.freezeValue), freezeBytes, error)) {
+                if (entry.type == core::TypedScanValueType::Utf8String || entry.type == core::TypedScanValueType::ByteArray) {
+                    entry.byteSize = freezeBytes.size();
+                }
+                if (!core::WriteMemory(pid, entry.address, freezeBytes, error)) {
+                    entry.status = "freeze write failed";
+                } else {
+                    entry.status = "frozen";
+                }
+            } else {
+                entry.status = "freeze parse failed";
+            }
+            entry.nextFreeze = now + freezeInterval;
+        }
+    }
+}
+
+void RipperForgeApp::PlacePreviewHost(const ImVec2& minScreen, const ImVec2& maxScreen) {
+    if (!previewReady_ || previewHost_ == nullptr) {
+        return;
+    }
+
+    POINT tl{static_cast<LONG>(minScreen.x), static_cast<LONG>(minScreen.y)};
+    POINT br{static_cast<LONG>(maxScreen.x), static_cast<LONG>(maxScreen.y)};
+    ScreenToClient(hwnd_, &tl);
+    ScreenToClient(hwnd_, &br);
+
+    const int width = std::max(1, static_cast<int>(br.x - tl.x));
+    const int height = std::max(1, static_cast<int>(br.y - tl.y));
+    SetWindowPos(previewHost_, HWND_TOP, tl.x, tl.y, width, height, SWP_NOACTIVATE);
+    ShowWindow(previewHost_, SW_SHOWNA);
+    previewRenderer_.Resize();
+    previewVisibleThisFrame_ = true;
+}
 
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
-    INITCOMMONCONTROLSEX controls{};
-    controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES;
-    InitCommonControlsEx(&controls);
-
-    MainWindow window;
-    if (!window.Create(instance)) {
-        MessageBoxW(nullptr, L"Failed to start RipperForge.", L"RipperForge", MB_ICONERROR | MB_OK);
+    RipperForgeApp app;
+    if (!app.Initialize(instance)) {
+        std::string message = "Failed to initialize RipperForge ImGui runtime.";
+        if (!app.InitFailureReason().empty()) {
+            message += "\n\n";
+            message += app.InitFailureReason();
+        }
+        MessageBoxA(nullptr, message.c_str(), "RipperForge", MB_ICONERROR | MB_OK);
         return 1;
     }
-
-    return window.Run();
+    return app.Run();
 }
