@@ -115,6 +115,8 @@ float4 main(PSIn input) : SV_TARGET
 
 struct Dx11PreviewRenderer::Impl {
     HWND hostWindow = nullptr;
+    UINT clientWidth = 0;
+    UINT clientHeight = 0;
 
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -222,13 +224,23 @@ void Dx11PreviewRenderer::Resize() {
     if (rect.right <= rect.left || rect.bottom <= rect.top) {
         return;
     }
+    const UINT width = static_cast<UINT>(std::max(1L, rect.right - rect.left));
+    const UINT height = static_cast<UINT>(std::max(1L, rect.bottom - rect.top));
+    if (impl_->clientWidth == width && impl_->clientHeight == height) {
+        return;
+    }
 
     impl_->context->OMSetRenderTargets(0, nullptr, nullptr);
     impl_->renderTargetView.Reset();
     impl_->depthStencilView.Reset();
     impl_->depthTexture.Reset();
 
-    impl_->swapChain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+    const HRESULT hr = impl_->swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) {
+        return;
+    }
+    impl_->clientWidth = width;
+    impl_->clientHeight = height;
 
     std::string ignored;
     CreateRenderTargets(ignored);
@@ -340,6 +352,8 @@ bool Dx11PreviewRenderer::CreateDeviceAndSwapChain(std::string& error) {
     GetClientRect(impl_->hostWindow, &rect);
     const UINT width = static_cast<UINT>(std::max(1L, rect.right - rect.left));
     const UINT height = static_cast<UINT>(std::max(1L, rect.bottom - rect.top));
+    impl_->clientWidth = width;
+    impl_->clientHeight = height;
 
     DXGI_SWAP_CHAIN_DESC swapDesc{};
     swapDesc.BufferDesc.Width = width;

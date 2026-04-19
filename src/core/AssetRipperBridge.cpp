@@ -164,8 +164,14 @@ bool AssetRipperBridge::StartCapture(DWORD pid, std::string& error) {
     }
 
     if (!std::filesystem::exists(resolvedDllPath)) {
-        error = "Capture DLL was not found at path: " + resolvedDllPath.string();
-        return false;
+        const std::filesystem::path fallbackCaptureDll = ResolveDefaultCaptureDll(moduleDirectory_);
+        if (std::filesystem::exists(fallbackCaptureDll)) {
+            Logger::Instance().Info("Configured capture DLL missing. Falling back to: " + fallbackCaptureDll.string());
+            resolvedDllPath = fallbackCaptureDll;
+        } else {
+            error = "Capture DLL was not found at path: " + resolvedDllPath.string();
+            return false;
+        }
     }
     captureDllPath_ = resolvedDllPath.wstring();
 
@@ -375,7 +381,7 @@ bool AssetRipperBridge::TryLoadBridgeDll(const std::filesystem::path& moduleDire
 }
 
 std::filesystem::path AssetRipperBridge::ResolveDefaultCaptureDll(const std::filesystem::path& moduleDirectory) const {
-    constexpr std::array<const wchar_t*, 10> kCandidates = {
+    constexpr std::array<const wchar_t*, 14> kCandidates = {
         L"capture\\ripper_new6.dll",
         L"capture\\ripper.dll",
         L"ripper_new6.dll",
@@ -386,6 +392,10 @@ std::filesystem::path AssetRipperBridge::ResolveDefaultCaptureDll(const std::fil
         L"external\\AssetRIpper\\ripper_new6.dll",
         L"external\\AssetRIpper\\ripper.dll",
         L"external\\AssetRIpper\\build\\ripper_new6.dll",
+        L"..\\..\\capture\\ripper_new6.dll",
+        L"..\\..\\capture\\ripper.dll",
+        L"..\\..\\external\\AssetRIpper\\ripper_new6.dll",
+        L"..\\..\\external\\AssetRIpper\\ripper.dll",
     };
 
     for (const auto* candidate : kCandidates) {

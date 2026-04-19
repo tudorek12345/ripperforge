@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cwctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -143,13 +144,17 @@ std::wstring ResolveRuntimeDataRoot(const std::wstring& moduleDir) {
 }
 
 std::wstring ResolveBundledCaptureDllPath(const std::wstring& moduleDir) {
-    constexpr std::array<const wchar_t*, 6> kCandidates = {
+    constexpr std::array<const wchar_t*, 10> kCandidates = {
         L"capture\\ripper_new6.dll",
         L"capture\\ripper.dll",
         L"ripper_new6.dll",
         L"ripper.dll",
         L"external\\AssetRIpper\\ripper_new6.dll",
         L"external\\AssetRIpper\\ripper.dll",
+        L"..\\..\\capture\\ripper_new6.dll",
+        L"..\\..\\capture\\ripper.dll",
+        L"..\\..\\external\\AssetRIpper\\ripper_new6.dll",
+        L"..\\..\\external\\AssetRIpper\\ripper.dll",
     };
 
     const std::filesystem::path modulePath(moduleDir);
@@ -633,6 +638,7 @@ private:
     bool dockLayoutBuilt_ = false;
     bool previewVisibleThisFrame_ = false;
     bool previewReady_ = false;
+    bool previewHostVisible_ = false;
     bool showLogAutoScroll_ = true;
 
     std::wstring moduleDir_;
@@ -721,6 +727,11 @@ private:
 
     std::chrono::steady_clock::time_point lastFrameTime_{};
     std::string initFailureReason_;
+
+    int previewHostX_ = -1;
+    int previewHostY_ = -1;
+    int previewHostWidth_ = -1;
+    int previewHostHeight_ = -1;
 };
 
 bool RipperForgeApp::CreateMainWindow(HINSTANCE instance) {
@@ -873,8 +884,17 @@ bool RipperForgeApp::Initialize(HINSTANCE instance) {
         return false;
     }
 
-    ShowWindow(hwnd_, SW_SHOWDEFAULT);
+    ShowWindow(hwnd_, SW_SHOWNORMAL);
     UpdateWindow(hwnd_);
+    SetWindowPos(
+        hwnd_,
+        nullptr,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -989,6 +1009,7 @@ bool RipperForgeApp::Initialize(HINSTANCE instance) {
         if (previewRenderer_.Initialize(previewHost_, previewError)) {
             previewReady_ = true;
             ShowWindow(previewHost_, SW_HIDE);
+            previewHostVisible_ = false;
         } else {
             core::Logger::Instance().Error("DX11 preview init failed: " + previewError);
             core::Logger::Instance().Info("DX11 preview disabled; asset scan and export remain available.");
@@ -1054,6 +1075,32 @@ void RipperForgeApp::LoadState() {
 
     if (BufferString(captureDllPath_).empty()) {
         SetBuffer(captureDllPath_, bundledCaptureDllPath_);
+    }
+    {
+        const std::wstring configuredCaptureDll = Utf8ToWide(BufferString(captureDllPath_));
+        if (!configuredCaptureDll.empty()) {
+            std::error_code captureEc;
+            std::filesystem::path configuredPath(configuredCaptureDll);
+            if (!configuredPath.is_absolute()) {
+                configuredPath = std::filesystem::path(moduleDir_) / configuredPath;
+            }
+            if (!std::filesystem::exists(configuredPath, captureEc) || captureEc) {
+                std::filesystem::path fallbackPath(bundledCaptureDllPath_);
+                if (!fallbackPath.is_absolute()) {
+                    fallbackPath = std::filesystem::path(moduleDir_) / fallbackPath;
+                }
+                std::error_code fallbackEc;
+                if (std::filesystem::exists(fallbackPath, fallbackEc) && !fallbackEc) {
+                    SetBuffer(captureDllPath_, fallbackPath.wstring());
+                    core::Logger::Instance().Info(
+                        "Capture DLL path was missing and was reset to: " + WideToUtf8(fallbackPath.wstring()));
+                } else {
+                    core::Logger::Instance().Error(
+                        "Configured capture DLL does not exist and no fallback was found. Checked: " +
+                        WideToUtf8(configuredPath.wstring()) + " and " + WideToUtf8(fallbackPath.wstring()));
+                }
+            }
+        }
     }
     if (BufferString(captureOutputDir_).empty()) {
         SetBuffer(captureOutputDir_, (std::filesystem::path(runtimeDataDir_) / L"captures").wstring());
@@ -1187,7 +1234,7 @@ LRESULT CALLBACK RipperForgeApp::WindowProcSetup(HWND hwnd, UINT message, WPARAM
         const auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
         auto* self = reinterpret_cast<RipperForgeApp*>(createStruct->lpCreateParams);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-        return DefWindowProcW(hwnd, message, wParam, lParam);
+        return TRUE;
     }
 
     auto* self = reinterpret_cast<RipperForgeApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1278,14 +1325,15 @@ void RipperForgeApp::BeginFrame() {
 
     HandleHotkeys();
 
-    if (previewReady_ && previewHost_ != nullptr && IsWindowVisible(previewHost_)) {
+    if (previewReady_ && previewHost_ != nullptr && previewHostVisible_) {
         previewRenderer_.Render(std::max(0.0001f, deltaSeconds));
     }
 }
 
 void RipperForgeApp::EndFrame() {
-    if (!previewVisibleThisFrame_ && previewHost_ != nullptr) {
+    if (!previewVisibleThisFrame_ && previewHost_ != nullptr && previewHostVisible_) {
         ShowWindow(previewHost_, SW_HIDE);
+        previewHostVisible_ = false;
     }
 
     ImGui::Render();
@@ -1519,8 +1567,15 @@ void RipperForgeApp::RenderInjectorTab() {
         }
     }
 
+    const bool canInject = (SelectedPid() != 0) && !BufferString(injectDllPath_).empty();
+    if (!canInject) {
+        ImGui::BeginDisabled();
+    }
     if (ImGui::Button("Inject Selected Process")) {
         InjectDllFromBuffer(injectDllPath_, "Injector");
+    }
+    if (!canInject) {
+        ImGui::EndDisabled();
     }
 }
 
@@ -1548,9 +1603,19 @@ void RipperForgeApp::RenderAssetRipperTab() {
         }
     }
 
+    const bool canStartCapture =
+        (SelectedPid() != 0) &&
+        !BufferString(captureDllPath_).empty() &&
+        !BufferString(captureOutputDir_).empty();
     if (!captureRunning_) {
+        if (!canStartCapture) {
+            ImGui::BeginDisabled();
+        }
         if (ImGui::Button("Start Capture")) {
             StartCapture();
+        }
+        if (!canStartCapture) {
+            ImGui::EndDisabled();
         }
     } else {
         if (ImGui::Button("Stop Capture")) {
@@ -1673,8 +1738,15 @@ void RipperForgeApp::RenderHookManagerTab() {
         GenerateHookTemplate();
     }
     ImGui::SameLine();
+    const bool canInjectHook = (SelectedPid() != 0) && !BufferString(hookDllPath_).empty();
+    if (!canInjectHook) {
+        ImGui::BeginDisabled();
+    }
     if (ImGui::Button("Inject Hook DLL")) {
         InjectDllFromBuffer(hookDllPath_, "Hook");
+    }
+    if (!canInjectHook) {
+        ImGui::EndDisabled();
     }
 
     if (selectedHookBackend_ == 0) {
@@ -1719,20 +1791,43 @@ void RipperForgeApp::RenderReverseToolkitTab() {
 
         ImGui::TableSetColumnIndex(1);
         ImGui::TextUnformatted("Actions");
+        const bool canStartFirstScan = !typedScanRunning_ && (SelectedPid() != 0);
+        if (!canStartFirstScan) {
+            ImGui::BeginDisabled();
+        }
         if (ImGui::Button(typedScanRunning_ ? "Scanning..." : "First Scan")) {
             StartTypedScanFirst();
         }
+        if (!canStartFirstScan) {
+            ImGui::EndDisabled();
+        }
         ImGui::SameLine();
+        const bool canStartNextScan = !typedScanRunning_ && typedScanHasSession_ && !typedScanSession_.addresses.empty();
+        if (!canStartNextScan) {
+            ImGui::BeginDisabled();
+        }
         if (ImGui::Button("Next Scan")) {
             StartTypedScanNext();
+        }
+        if (!canStartNextScan) {
+            ImGui::EndDisabled();
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel Scan")) {
             CancelTypedScan();
         }
         ImGui::SameLine();
+        const bool canAddWatch =
+            (selectedTypedResultIndex_ >= 0) &&
+            (selectedTypedResultIndex_ < static_cast<int>(typedScanRows_.size()));
+        if (!canAddWatch) {
+            ImGui::BeginDisabled();
+        }
         if (ImGui::Button("Add Result To Watch")) {
             AddSelectedScanResultToWatch();
+        }
+        if (!canAddWatch) {
+            ImGui::EndDisabled();
         }
 
         ImGui::EndTable();
@@ -1853,8 +1948,15 @@ void RipperForgeApp::RenderReverseToolkitTab() {
     ImGui::Separator();
     if (ImGui::CollapsingHeader("AoB Pattern Scan (Legacy API)")) {
         ImGui::InputText("Pattern", patternScanInput_.data(), patternScanInput_.size());
+        const bool canStartPatternScan = !patternScanRunning_ && (SelectedPid() != 0);
+        if (!canStartPatternScan) {
+            ImGui::BeginDisabled();
+        }
         if (ImGui::Button(patternScanRunning_ ? "Pattern Scanning..." : "Start Pattern Scan")) {
             StartPatternScan();
+        }
+        if (!canStartPatternScan) {
+            ImGui::EndDisabled();
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel Pattern Scan")) {
@@ -1941,14 +2043,23 @@ bool RipperForgeApp::InjectDllFromBuffer(const std::array<char, 1024>& pathBuffe
         return false;
     }
 
-    const std::wstring dllPath = Utf8ToWide(BufferString(pathBuffer));
+    std::filesystem::path dllPath = std::filesystem::path(Utf8ToWide(BufferString(pathBuffer)));
     if (dllPath.empty()) {
         core::Logger::Instance().Error("DLL path is empty.");
         return false;
     }
+    if (!dllPath.is_absolute()) {
+        dllPath = std::filesystem::path(moduleDir_) / dllPath;
+    }
+    std::error_code existsEc;
+    if (!std::filesystem::exists(dllPath, existsEc) || existsEc) {
+        core::Logger::Instance().Error(
+            std::string(contextLabel) + " DLL was not found: " + WideToUtf8(dllPath.wstring()));
+        return false;
+    }
 
     std::string error;
-    if (!core::InjectDll(pid, dllPath, error)) {
+    if (!core::InjectDll(pid, dllPath.wstring(), error)) {
         core::Logger::Instance().Error(std::string(contextLabel) + " injection failed: " + error);
         return false;
     }
@@ -2623,16 +2734,51 @@ void RipperForgeApp::PlacePreviewHost(const ImVec2& minScreen, const ImVec2& max
         return;
     }
 
-    POINT tl{static_cast<LONG>(minScreen.x), static_cast<LONG>(minScreen.y)};
-    POINT br{static_cast<LONG>(maxScreen.x), static_cast<LONG>(maxScreen.y)};
-    ScreenToClient(hwnd_, &tl);
-    ScreenToClient(hwnd_, &br);
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    const float viewportPosX = (mainViewport != nullptr) ? mainViewport->Pos.x : 0.0f;
+    const float viewportPosY = (mainViewport != nullptr) ? mainViewport->Pos.y : 0.0f;
 
-    const int width = std::max(1, static_cast<int>(br.x - tl.x));
-    const int height = std::max(1, static_cast<int>(br.y - tl.y));
-    SetWindowPos(previewHost_, HWND_TOP, tl.x, tl.y, width, height, SWP_NOACTIVATE);
-    ShowWindow(previewHost_, SW_SHOWNA);
-    previewRenderer_.Resize();
+    int x = static_cast<int>(std::lround(minScreen.x - viewportPosX));
+    int y = static_cast<int>(std::lround(minScreen.y - viewportPosY));
+    int width = std::max(1, static_cast<int>(std::lround(maxScreen.x - minScreen.x)));
+    int height = std::max(1, static_cast<int>(std::lround(maxScreen.y - minScreen.y)));
+
+    RECT clientRect{};
+    GetClientRect(hwnd_, &clientRect);
+    const int clientRight = static_cast<int>(clientRect.right);
+    const int clientBottom = static_cast<int>(clientRect.bottom);
+    x = std::clamp(x, 0, std::max(0, clientRight - 1));
+    y = std::clamp(y, 0, std::max(0, clientBottom - 1));
+    width = std::min(width, std::max(1, clientRight - x));
+    height = std::min(height, std::max(1, clientBottom - y));
+
+    const bool boundsChanged =
+        previewHostX_ != x ||
+        previewHostY_ != y ||
+        previewHostWidth_ != width ||
+        previewHostHeight_ != height;
+
+    if (boundsChanged) {
+        SetWindowPos(
+            previewHost_,
+            nullptr,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+        previewRenderer_.Resize();
+        previewHostX_ = x;
+        previewHostY_ = y;
+        previewHostWidth_ = width;
+        previewHostHeight_ = height;
+    }
+
+    if (!previewHostVisible_) {
+        ShowWindow(previewHost_, SW_SHOWNA);
+        previewHostVisible_ = true;
+    }
+
     previewVisibleThisFrame_ = true;
 }
 
