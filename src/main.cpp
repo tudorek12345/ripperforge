@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -111,6 +112,56 @@ std::wstring GetModuleDirectory() {
     wchar_t modulePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
     return std::filesystem::path(modulePath).parent_path().wstring();
+}
+
+std::wstring GetKnownFolderPathString(REFKNOWNFOLDERID folderId) {
+    PWSTR path = nullptr;
+    const HRESULT hr = SHGetKnownFolderPath(folderId, KF_FLAG_DEFAULT, nullptr, &path);
+    if (FAILED(hr) || path == nullptr) {
+        if (path != nullptr) {
+            CoTaskMemFree(path);
+        }
+        return {};
+    }
+    std::wstring result = path;
+    CoTaskMemFree(path);
+    return result;
+}
+
+std::wstring ResolveRuntimeDataRoot(const std::wstring& moduleDir) {
+    const std::wstring localAppData = GetKnownFolderPathString(FOLDERID_LocalAppData);
+    if (!localAppData.empty()) {
+        return (std::filesystem::path(localAppData) / L"RipperForge").wstring();
+    }
+
+    wchar_t tempPath[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tempPath) > 0) {
+        return (std::filesystem::path(tempPath) / L"RipperForge").wstring();
+    }
+
+    return (std::filesystem::path(moduleDir) / L"config").wstring();
+}
+
+std::wstring ResolveBundledCaptureDllPath(const std::wstring& moduleDir) {
+    constexpr std::array<const wchar_t*, 6> kCandidates = {
+        L"capture\\ripper_new6.dll",
+        L"capture\\ripper.dll",
+        L"ripper_new6.dll",
+        L"ripper.dll",
+        L"external\\AssetRIpper\\ripper_new6.dll",
+        L"external\\AssetRIpper\\ripper.dll",
+    };
+
+    const std::filesystem::path modulePath(moduleDir);
+    for (const auto* candidate : kCandidates) {
+        const std::filesystem::path resolved = modulePath / candidate;
+        std::error_code ec;
+        if (std::filesystem::exists(resolved, ec) && !ec) {
+            return resolved.wstring();
+        }
+    }
+
+    return (modulePath / L"capture" / L"ripper_new6.dll").wstring();
 }
 
 template <size_t N>
@@ -585,8 +636,15 @@ private:
     bool showLogAutoScroll_ = true;
 
     std::wstring moduleDir_;
+    std::wstring runtimeDataDir_;
     std::wstring configPath_;
-    std::wstring pluginDir_;
+    std::wstring imguiIniPath_;
+    std::wstring bundledPluginDir_;
+    std::wstring userPluginDir_;
+    std::wstring bundledCaptureDllPath_;
+    std::wstring legacyConfigPath_;
+    std::wstring legacyImGuiIniPath_;
+    bool legacyStateMigrated_ = false;
     std::string imguiIniPathUtf8_;
 
     core::AppSettings settings_;
@@ -826,9 +884,77 @@ bool RipperForgeApp::Initialize(HINSTANCE instance) {
     io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
 
     moduleDir_ = GetModuleDirectory();
-    configPath_ = (std::filesystem::path(moduleDir_) / L"config" / L"settings.json").wstring();
-    pluginDir_ = (std::filesystem::path(moduleDir_) / L"plugins").wstring();
-    imguiIniPathUtf8_ = WideToUtf8((std::filesystem::path(moduleDir_) / L"config" / L"imgui_layout.ini").wstring());
+    runtimeDataDir_ = ResolveRuntimeDataRoot(moduleDir_);
+    bundledPluginDir_ = (std::filesystem::path(moduleDir_) / L"plugins").wstring();
+    userPluginDir_ = (std::filesystem::path(runtimeDataDir_) / L"plugins").wstring();
+    bundledCaptureDllPath_ = ResolveBundledCaptureDllPath(moduleDir_);
+    configPath_ = (std::filesystem::path(runtimeDataDir_) / L"settings.json").wstring();
+    imguiIniPath_ = (std::filesystem::path(runtimeDataDir_) / L"imgui_layout.ini").wstring();
+    legacyConfigPath_ = (std::filesystem::path(moduleDir_) / L"config" / L"settings.json").wstring();
+    legacyImGuiIniPath_ = (std::filesystem::path(moduleDir_) / L"config" / L"imgui_layout.ini").wstring();
+
+    std::error_code pathEc;
+    std::filesystem::create_directories(runtimeDataDir_, pathEc);
+    if (pathEc) {
+        core::Logger::Instance().Error(
+            "Failed to create runtime data directory: " + WideToUtf8(runtimeDataDir_) +
+            " (" + pathEc.message() + ")");
+    }
+    pathEc.clear();
+    std::filesystem::create_directories(userPluginDir_, pathEc);
+    if (pathEc) {
+        core::Logger::Instance().Error(
+            "Failed to create user plugin directory: " + WideToUtf8(userPluginDir_) +
+            " (" + pathEc.message() + ")");
+    }
+    pathEc.clear();
+    std::filesystem::create_directories(std::filesystem::path(runtimeDataDir_) / L"hooks", pathEc);
+    if (pathEc) {
+        core::Logger::Instance().Error(
+            "Failed to create hook output directory: " + WideToUtf8((std::filesystem::path(runtimeDataDir_) / L"hooks").wstring()) +
+            " (" + pathEc.message() + ")");
+    }
+    pathEc.clear();
+    std::filesystem::create_directories(std::filesystem::path(runtimeDataDir_) / L"captures", pathEc);
+    if (pathEc) {
+        core::Logger::Instance().Error(
+            "Failed to create capture output directory: " + WideToUtf8((std::filesystem::path(runtimeDataDir_) / L"captures").wstring()) +
+            " (" + pathEc.message() + ")");
+    }
+
+    std::error_code migrationEc;
+    if (!std::filesystem::exists(configPath_, migrationEc)) {
+        migrationEc.clear();
+        if (std::filesystem::exists(legacyConfigPath_, migrationEc)) {
+            std::filesystem::copy_file(legacyConfigPath_, configPath_, std::filesystem::copy_options::none, migrationEc);
+            if (!migrationEc) {
+                legacyStateMigrated_ = true;
+                core::Logger::Instance().Info(
+                    "Imported legacy settings into user runtime path: " + WideToUtf8(configPath_));
+            } else {
+                core::Logger::Instance().Error(
+                    "Failed to import legacy settings: " + WideToUtf8(legacyConfigPath_) +
+                    " -> " + WideToUtf8(configPath_) + " (" + migrationEc.message() + ")");
+            }
+        }
+    }
+    migrationEc.clear();
+    if (!std::filesystem::exists(imguiIniPath_, migrationEc)) {
+        migrationEc.clear();
+        if (std::filesystem::exists(legacyImGuiIniPath_, migrationEc)) {
+            std::filesystem::copy_file(legacyImGuiIniPath_, imguiIniPath_, std::filesystem::copy_options::none, migrationEc);
+            if (!migrationEc) {
+                core::Logger::Instance().Info(
+                    "Imported legacy ImGui layout into user runtime path: " + WideToUtf8(imguiIniPath_));
+            } else {
+                core::Logger::Instance().Error(
+                    "Failed to import legacy ImGui layout: " + WideToUtf8(legacyImGuiIniPath_) +
+                    " -> " + WideToUtf8(imguiIniPath_) + " (" + migrationEc.message() + ")");
+            }
+        }
+    }
+
+    imguiIniPathUtf8_ = WideToUtf8(imguiIniPath_);
     io.IniFilename = imguiIniPathUtf8_.c_str();
 
     if (!ImGui_ImplWin32_Init(hwnd_)) {
@@ -865,15 +991,18 @@ bool RipperForgeApp::Initialize(HINSTANCE instance) {
             ShowWindow(previewHost_, SW_HIDE);
         } else {
             core::Logger::Instance().Error("DX11 preview init failed: " + previewError);
+            core::Logger::Instance().Info("DX11 preview disabled; asset scan and export remain available.");
             previewReady_ = false;
         }
+    } else {
+        core::Logger::Instance().Info("DX11 preview disabled: preview host window was not created.");
     }
 
     assetBridge_.Initialize(moduleDir_);
     assetBridge_.SetCaptureDllPath(Utf8ToWide(BufferString(captureDllPath_)));
     assetBridge_.SetOutputDirectory(Utf8ToWide(BufferString(captureOutputDir_)));
 
-    pluginManager_.Reload(pluginDir_);
+    pluginManager_.Reload(std::vector<std::wstring>{bundledPluginDir_, userPluginDir_});
     RefreshProcessList(true);
     RequestCaptureScan(false);
 
@@ -900,6 +1029,9 @@ void RipperForgeApp::EnsureDefaultScanRange() {
 
 void RipperForgeApp::LoadState() {
     settings_ = core::LoadSettings(configPath_);
+    if (legacyStateMigrated_) {
+        settings_.legacyConfigMigrated = true;
+    }
 
     autoRefreshProcesses_ = settings_.autoRefresh;
     processRefreshIntervalMs_ = std::max<uint32_t>(500, settings_.refreshIntervalMs);
@@ -921,10 +1053,28 @@ void RipperForgeApp::LoadState() {
     selectedHookBackend_ = (_wcsicmp(settings_.hookBackend.c_str(), L"Detours") == 0) ? 1 : 0;
 
     if (BufferString(captureDllPath_).empty()) {
-        SetBuffer(captureDllPath_, L"ripper_new6.dll");
+        SetBuffer(captureDllPath_, bundledCaptureDllPath_);
     }
     if (BufferString(captureOutputDir_).empty()) {
-        SetBuffer(captureOutputDir_, (std::filesystem::path(moduleDir_) / L"captures").wstring());
+        SetBuffer(captureOutputDir_, (std::filesystem::path(runtimeDataDir_) / L"captures").wstring());
+    }
+    {
+        auto normalizePath = [](const std::wstring& value) {
+            std::wstring normalized = std::filesystem::path(value).lexically_normal().wstring();
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](wchar_t c) {
+                return static_cast<wchar_t>(towlower(c));
+            });
+            return normalized;
+        };
+
+        const std::wstring configuredOutput = Utf8ToWide(BufferString(captureOutputDir_));
+        const std::wstring legacyOutput = (std::filesystem::path(moduleDir_) / L"captures").wstring();
+        if (!configuredOutput.empty() && normalizePath(configuredOutput) == normalizePath(legacyOutput)) {
+            const std::wstring migratedOutput = (std::filesystem::path(runtimeDataDir_) / L"captures").wstring();
+            SetBuffer(captureOutputDir_, migratedOutput);
+            core::Logger::Instance().Info(
+                "Capture output path migrated to user runtime directory: " + WideToUtf8(migratedOutput));
+        }
     }
 
     watchList_.clear();
@@ -958,6 +1108,11 @@ void RipperForgeApp::SaveState() {
     if (settings_.uiDensity.empty()) {
         settings_.uiDensity = L"compact";
     }
+    settings_.runtimeDataRoot = runtimeDataDir_;
+    settings_.runtimeUserPluginDir = userPluginDir_;
+    settings_.runtimeBundledPluginDir = bundledPluginDir_;
+    settings_.runtimeBundledCaptureDllPath = bundledCaptureDllPath_;
+    settings_.legacyConfigMigrated = settings_.legacyConfigMigrated || legacyStateMigrated_;
 
     settings_.reverseToolkitScanDefaults.valueType = TypeToWString(TypeFromIndex(typedScanTypeIndex_));
     settings_.reverseToolkitScanDefaults.compareMode = CompareToWString(CompareModeFromIndex(typedScanCompareIndex_));
@@ -977,7 +1132,9 @@ void RipperForgeApp::SaveState() {
         settings_.reverseToolkitWatchList.push_back(std::move(persisted));
     }
 
-    core::SaveSettings(configPath_, settings_);
+    if (!core::SaveSettings(configPath_, settings_)) {
+        core::Logger::Instance().Error("Failed to save settings: " + WideToUtf8(configPath_));
+    }
 }
 
 RipperForgeApp::~RipperForgeApp() {
@@ -1717,7 +1874,7 @@ void RipperForgeApp::RenderReverseToolkitTab() {
 
 void RipperForgeApp::RenderPluginsTab() {
     if (ImGui::Button("Reload Plugins")) {
-        pluginManager_.Reload(pluginDir_);
+        pluginManager_.Reload(std::vector<std::wstring>{bundledPluginDir_, userPluginDir_});
         core::Logger::Instance().Info("Plugin catalog refreshed.");
     }
 
@@ -1846,6 +2003,22 @@ void RipperForgeApp::RequestCaptureScan(bool logResult) {
     const std::wstring outputDir = Utf8ToWide(BufferString(captureOutputDir_));
     if (outputDir.empty()) {
         core::Logger::Instance().Error("Capture output directory is empty.");
+        return;
+    }
+    std::error_code outputEc;
+    if (!std::filesystem::exists(outputDir, outputEc)) {
+        outputEc.clear();
+        std::filesystem::create_directories(outputDir, outputEc);
+        if (outputEc) {
+            core::Logger::Instance().Error(
+                "Capture output directory is not writable: " + WideToUtf8(outputDir) +
+                " (" + outputEc.message() + ")");
+            return;
+        }
+    } else if (outputEc) {
+        core::Logger::Instance().Error(
+            "Could not inspect capture output directory: " + WideToUtf8(outputDir) +
+            " (" + outputEc.message() + ")");
         return;
     }
 
@@ -2054,18 +2227,20 @@ void RipperForgeApp::GenerateHookTemplate() {
     const std::wstring backend = kHookBackends[static_cast<size_t>(std::clamp(selectedHookBackend_, 0, 1))];
 
     std::filesystem::path outputDir =
-        std::filesystem::path(moduleDir_) / L"hooks" / (engine + L"_" + backend);
+        std::filesystem::path(runtimeDataDir_) / L"hooks" / (engine + L"_" + backend);
     std::error_code ec;
     std::filesystem::create_directories(outputDir, ec);
     if (ec) {
-        core::Logger::Instance().Error("Could not create hook output directory.");
+        core::Logger::Instance().Error(
+            "Could not create hook output directory: " + WideToUtf8(outputDir.wstring()) +
+            " (" + ec.message() + ")");
         return;
     }
 
     std::filesystem::path outputPath = outputDir / (engine + L"HookTemplate.cpp");
     std::ofstream stream(outputPath, std::ios::binary | std::ios::trunc);
     if (!stream.good()) {
-        core::Logger::Instance().Error("Failed to write hook template file.");
+        core::Logger::Instance().Error("Failed to write hook template file: " + WideToUtf8(outputPath.wstring()));
         return;
     }
 

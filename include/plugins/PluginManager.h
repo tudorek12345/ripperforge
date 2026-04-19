@@ -20,6 +20,7 @@ class PluginManager {
 public:
     ~PluginManager();
 
+    void Reload(const std::vector<std::wstring>& pluginDirectories);
     void Reload(const std::wstring& pluginDirectory);
     void UnloadAll();
 

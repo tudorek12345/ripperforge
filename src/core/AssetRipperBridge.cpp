@@ -1,6 +1,7 @@
 #include "core/AssetRipperBridge.h"
 
 #include <Windows.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <array>
@@ -37,6 +38,21 @@ bool HasAnyExtension(const std::filesystem::path& path, const std::array<const w
         }
     }
     return false;
+}
+
+std::filesystem::path ResolveUserWritableDataRoot() {
+    PWSTR localAppData = nullptr;
+    const HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &localAppData);
+    if (FAILED(hr) || localAppData == nullptr) {
+        if (localAppData != nullptr) {
+            CoTaskMemFree(localAppData);
+        }
+        return {};
+    }
+
+    const std::filesystem::path root = std::filesystem::path(localAppData) / L"RipperForge";
+    CoTaskMemFree(localAppData);
+    return root;
 }
 
 void WriteAssetRipperConfig(const std::wstring& outputDir, DWORD pid) {
@@ -101,10 +117,14 @@ AssetRipperBridge::~AssetRipperBridge() {
 bool AssetRipperBridge::Initialize(const std::wstring& moduleDirectory) {
     moduleDirectory_ = std::filesystem::path(moduleDirectory);
 
-    std::error_code ec;
-    std::filesystem::create_directories(moduleDirectory_ / L"captures", ec);
+    const std::filesystem::path preferredDataRoot = ResolveUserWritableDataRoot();
+    const std::filesystem::path fallbackDataRoot = moduleDirectory_ / L"captures";
+    const std::filesystem::path dataRoot = preferredDataRoot.empty() ? fallbackDataRoot : preferredDataRoot / L"captures";
 
-    outputDirectory_ = (moduleDirectory_ / L"captures").wstring();
+    std::error_code ec;
+    std::filesystem::create_directories(dataRoot, ec);
+
+    outputDirectory_ = dataRoot.wstring();
     captureDllPath_ = ResolveDefaultCaptureDll(moduleDirectory_).wstring();
 
     TryLoadBridgeDll(moduleDirectory_);
@@ -144,7 +164,7 @@ bool AssetRipperBridge::StartCapture(DWORD pid, std::string& error) {
     }
 
     if (!std::filesystem::exists(resolvedDllPath)) {
-        error = "Capture DLL was not found.";
+        error = "Capture DLL was not found at path: " + resolvedDllPath.string();
         return false;
     }
     captureDllPath_ = resolvedDllPath.wstring();
@@ -152,7 +172,7 @@ bool AssetRipperBridge::StartCapture(DWORD pid, std::string& error) {
     std::error_code ec;
     std::filesystem::create_directories(outputDirectory_, ec);
     if (ec) {
-        error = "Could not create capture output directory.";
+        error = "Could not create capture output directory: " + std::filesystem::path(outputDirectory_).string();
         return false;
     }
 
@@ -355,7 +375,9 @@ bool AssetRipperBridge::TryLoadBridgeDll(const std::filesystem::path& moduleDire
 }
 
 std::filesystem::path AssetRipperBridge::ResolveDefaultCaptureDll(const std::filesystem::path& moduleDirectory) const {
-    constexpr std::array<const wchar_t*, 8> kCandidates = {
+    constexpr std::array<const wchar_t*, 10> kCandidates = {
+        L"capture\\ripper_new6.dll",
+        L"capture\\ripper.dll",
         L"ripper_new6.dll",
         L"ripper.dll",
         L"capture.dll",

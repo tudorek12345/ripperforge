@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="RipperForge"
+    Manufacturer="RipperForge"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="{EAF3E1EC-E7CC-4F74-9F5A-6CB2B5CC0B23}"
+    Language="1033"
+    InstallerVersion="500"
+    Scope="perMachine"
+    Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of RipperForge is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Feature Id="MainFeature" Title="RipperForge" Level="1">
+      <ComponentGroupRef Id="RipperForgeProductComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RipperForge">
+        <Directory Id="CAPTUREDIR" Name="capture" />
+        <Directory Id="PLUGINSDIR" Name="plugins" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuRipperForge" Name="RipperForge" />
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="RipperForgeProductComponents">
+      <Component Id="MainExecutableComponent" Directory="INSTALLFOLDER" Guid="*">
+        <File Id="RipperForgeExe" Source="$(var.PayloadDir)\RipperForge.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="ReadmeComponent" Directory="INSTALLFOLDER" Guid="*">
+        <File Id="RipperForgeReadme" Source="$(var.PayloadDir)\README.md" KeyPath="yes" />
+      </Component>
+
+      <Component Id="CaptureDllComponent" Directory="CAPTUREDIR" Guid="*">
+        <File Id="RipperForgeCaptureDll" Source="$(var.PayloadDir)\capture\ripper_new6.dll" KeyPath="yes" />
+      </Component>
+
+      <Component Id="PluginsFolderComponent" Directory="PLUGINSDIR" Guid="*">
+        <CreateFolder />
+        <RegistryValue Root="HKLM" Key="Software\RipperForge" Name="PluginsFolder" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="StartMenuComponent" Directory="ProgramMenuRipperForge" Guid="*">
+        <Shortcut
+          Id="StartMenuShortcut"
+          Name="RipperForge"
+          Description="RipperForge - Asset Injection + Reverse Toolkit"
+          Target="[INSTALLFOLDER]RipperForge.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveProgramMenuRipperForge" Directory="ProgramMenuRipperForge" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\RipperForge" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

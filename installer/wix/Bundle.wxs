@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix
+  xmlns="http://wixtoolset.org/schemas/v4/wxs"
+  xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+  xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Bundle
+    Name="RipperForge Setup"
+    Manufacturer="RipperForge"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="{D4ACF1A8-B102-4B98-907D-26D783D46994}">
+
+    <util:RegistrySearch
+      Id="VCRedistInstalledSearch"
+      Root="HKLM"
+      Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+      Value="Installed"
+      Variable="VCRedistInstalled"
+      Result="value" />
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+        Theme="hyperlinkLicense"
+        LicenseUrl="https://github.com/your-org/ripperforge"
+        SuppressOptionsUI="yes"
+        ShowVersion="yes" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <ExePackage
+        Id="VCppRedistX64"
+        SourceFile="$(var.VCRedistPath)"
+        DisplayName="Microsoft Visual C++ Redistributable (x64)"
+        InstallArguments="/quiet /norestart"
+        DetectCondition="VCRedistInstalled=1"
+        PerMachine="yes"
+        Permanent="yes"
+        Vital="yes"
+        Compressed="yes" />
+
+      <MsiPackage
+        Id="RipperForgeMsi"
+        SourceFile="$(var.MsiPath)"
+        Visible="no"
+        Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

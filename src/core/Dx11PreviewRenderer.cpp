@@ -360,43 +360,72 @@ bool Dx11PreviewRenderer::CreateDeviceAndSwapChain(std::string& error) {
     D3D_FEATURE_LEVEL featureLevels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
     D3D_FEATURE_LEVEL featureLevelOut = D3D_FEATURE_LEVEL_11_0;
 
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        creationFlags,
-        featureLevels,
-        static_cast<UINT>(std::size(featureLevels)),
-        D3D11_SDK_VERSION,
-        &swapDesc,
-        impl_->swapChain.GetAddressOf(),
-        impl_->device.GetAddressOf(),
-        &featureLevelOut,
-        impl_->context.GetAddressOf());
-
-    if (FAILED(hr)) {
+    const D3D_FEATURE_LEVEL fallbackLevels[] = {D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+    auto tryCreate = [&](D3D_DRIVER_TYPE driverType, UINT flags, const D3D_FEATURE_LEVEL* levels, UINT levelCount) {
         impl_->swapChain.Reset();
         impl_->device.Reset();
         impl_->context.Reset();
 
-        const D3D_FEATURE_LEVEL fallbackLevels[] = {D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
-        hr = D3D11CreateDeviceAndSwapChain(
+        return D3D11CreateDeviceAndSwapChain(
             nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
+            driverType,
             nullptr,
-            creationFlags,
-            fallbackLevels,
-            static_cast<UINT>(std::size(fallbackLevels)),
+            flags,
+            levels,
+            levelCount,
             D3D11_SDK_VERSION,
             &swapDesc,
             impl_->swapChain.GetAddressOf(),
             impl_->device.GetAddressOf(),
             &featureLevelOut,
             impl_->context.GetAddressOf());
+    };
+
+    HRESULT hr = tryCreate(
+        D3D_DRIVER_TYPE_HARDWARE,
+        creationFlags,
+        featureLevels,
+        static_cast<UINT>(std::size(featureLevels)));
+
+    // Many systems do not have the D3D debug layer installed; retry without it.
+    if (FAILED(hr) && (creationFlags & D3D11_CREATE_DEVICE_DEBUG) != 0) {
+        hr = tryCreate(
+            D3D_DRIVER_TYPE_HARDWARE,
+            creationFlags & ~D3D11_CREATE_DEVICE_DEBUG,
+            featureLevels,
+            static_cast<UINT>(std::size(featureLevels)));
     }
 
     if (FAILED(hr)) {
-        error = "D3D11CreateDeviceAndSwapChain failed: " + HrToString(hr);
+        hr = tryCreate(
+            D3D_DRIVER_TYPE_HARDWARE,
+            creationFlags & ~D3D11_CREATE_DEVICE_DEBUG,
+            fallbackLevels,
+            static_cast<UINT>(std::size(fallbackLevels)));
+    }
+
+    // Final fallback for environments where hardware device creation is blocked.
+    if (FAILED(hr)) {
+        hr = tryCreate(
+            D3D_DRIVER_TYPE_WARP,
+            creationFlags & ~D3D11_CREATE_DEVICE_DEBUG,
+            featureLevels,
+            static_cast<UINT>(std::size(featureLevels)));
+    }
+
+    if (FAILED(hr)) {
+        hr = tryCreate(
+            D3D_DRIVER_TYPE_WARP,
+            creationFlags & ~D3D11_CREATE_DEVICE_DEBUG,
+            fallbackLevels,
+            static_cast<UINT>(std::size(fallbackLevels)));
+    }
+
+    if (FAILED(hr)) {
+        error = "D3D11CreateDeviceAndSwapChain failed after hardware+WARP fallback: " + HrToString(hr);
+        if (hr == DXGI_ERROR_SDK_COMPONENT_MISSING) {
+            error += " (D3D debug runtime missing; install Graphics Tools or run without debug layer)";
+        }
         return false;
     }
 
